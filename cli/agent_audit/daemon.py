@@ -11,7 +11,7 @@ from typing import Optional, Set, Dict, Any
 from .config import load_config, save_config
 from .bpf_reader import load_bpf, get_map_id, fetch_events, deduplicate_events, unload_bpf, clear_map
 from .matcher import filter_events
-from .log_rotator import make_audit_logger
+from .log_rotator import make_audit_logger, make_runtime_logger
 
 _PID_FILE = "/root/tmp/agent-audit-daemon.pid"
 _CONFIG_PATH = str(Path(__file__).resolve().parent.parent.parent / "config.json")
@@ -19,6 +19,7 @@ _PIN_DIR = "/sys/fs/bpf/audit"
 
 _run_loop_flag = True
 _logger: Optional[object] = None
+_runtime_logger: Optional[object] = None
 
 
 # ── PID file ────────────────────────────────────────────────────────────────────
@@ -117,7 +118,7 @@ def _setup_inotify(config_path: str) -> Optional[int]:
 
 def run_loop() -> None:
     """Load BPF, poll map, filter events, write JSONL audit log."""
-    global _run_loop_flag, _logger
+    global _run_loop_flag, _logger, _runtime_logger
 
     signal.signal(signal.SIGTERM, _sig_handler)
     signal.signal(signal.SIGINT, _sig_handler)
@@ -134,7 +135,12 @@ def run_loop() -> None:
         print(f"BPF ELF not found: {bpf_elf}", file=sys.stderr)
         return
 
+    # Initialize dual logger system
     _logger = make_audit_logger(log_path, max_size_mb, backup_count)
+    runtime_log_dir = Path(__file__).resolve().parent.parent.parent / "logs"
+    runtime_log_path = str(runtime_log_dir / "runtime.log")
+    _runtime_logger = make_runtime_logger(runtime_log_path, max_size_mb=10, backup_count=3)
+
     inotify_fd = _setup_inotify(_CONFIG_PATH)
     last_inotify_check = 0.0
 
@@ -143,16 +149,18 @@ def run_loop() -> None:
     process_names = [t["process"] for t in targets if t.get("enabled", True)]
 
     if load_bpf(bpf_elf, _PIN_DIR):
-        _logger.log_event({"event": "bpf_loaded", "elf": bpf_elf, "targets": process_names})
+        _runtime_logger.info(f"BPF loaded: {bpf_elf}, targets: {process_names}")
     else:
-        _logger.log_event({"event": "bpf_load_failed", "elf": bpf_elf})
+        _runtime_logger.error(f"BPF load failed: {bpf_elf}")
         _logger.close()
+        _runtime_logger.close()
         return
 
     map_id = get_map_id()
     if map_id < 0:
-        _logger.log_event({"event": "map_id_not_found"})
+        _runtime_logger.error("BPF map ID not found")
         _logger.close()
+        _runtime_logger.close()
         return
 
     # Save map_id to config for reference
@@ -162,7 +170,7 @@ def run_loop() -> None:
     # Clear existing entries so we start fresh
     clear_map(map_id)
 
-    _logger.log_event({"event": "daemon_started", "map_id": map_id})
+    _runtime_logger.info(f"Daemon started, map_id: {map_id}")
 
     seen_events: Set[int] = set()
 
@@ -192,61 +200,174 @@ def run_loop() -> None:
             pass
         return info
 
-    def _aggregate_by_process(events):
-        """按 (pid, comm) 聚合事件，输出进程为主体的日志条目."""
-        from collections import defaultdict
-        groups = defaultdict(lambda: {"file_reads": [], "connects": [], "dns_queries": []})
-        process_info_cache = {}  # 缓存进程信息
+    # ── 进程信息缓存 ───────────────────────────────────────────────────
+    _process_info_cache: Dict[int, Dict] = {}
+    _cache_timestamps: Dict[int, float] = {}
+    _CACHE_TTL = 5.0  # 5秒缓存有效期
 
-        for event in events:
-            key = (event["pid"], event["comm"])
-            groups[key]["pid"] = event["pid"]
-            groups[key]["comm"] = event["comm"]
-            etype = event.get("type", "")
-            data = event.get("data", "")
-            if etype == "FILE" and data:
-                groups[key]["file_reads"].append(data)
-            elif etype == "NET" and data:
-                groups[key]["connects"].append(data)
-            elif etype == "DNS" and data:
-                groups[key]["dns_queries"].append(data)
+    def _get_process_info_cached(pid: int) -> Dict[str, Any]:
+        """带缓存的进程信息获取，减少重复 /proc 读取."""
+        now = time.time()
+        if pid in _process_info_cache:
+            cache_time = _cache_timestamps.get(pid, 0)
+            if now - cache_time < _CACHE_TTL:
+                return _process_info_cache[pid]
+        info = _get_process_info(pid)
+        _process_info_cache[pid] = info
+        _cache_timestamps[pid] = now
+        return info
 
-        result = []
+    # ── 进程链构建 ─────────────────────────────────────────────────────
+    def _build_proc_chain(pid: int, max_depth: int = 10, comm: str = "") -> str:
+        """构建进程链: 'python3(56105)->bash(1000)->systemd(1)'"""
+        chain_parts = []
+        current_pid = pid
+        visited = set()
+        first = True
+
+        for _ in range(max_depth):
+            if current_pid <= 0 or current_pid in visited:
+                break
+            visited.add(current_pid)
+
+            # 获取进程名（首次尝试使用 BPF 事件中的 comm）
+            if first and comm:
+                name = comm
+                first = False
+            else:
+                try:
+                    with open(f"/proc/{current_pid}/comm", "r") as f:
+                        name = f.read().strip()
+                except FileNotFoundError:
+                    name = "unknown"
+
+            chain_parts.append(f"{name}({current_pid})")
+
+            # 获取父进程PID
+            try:
+                with open(f"/proc/{current_pid}/stat", "r") as f:
+                    stat_fields = f.read().split()
+                    ppid = int(stat_fields[3]) if len(stat_fields) > 3 else 0
+            except FileNotFoundError:
+                ppid = 0
+
+            # 到达 systemd 或 kernel
+            if ppid <= 1:
+                if ppid == 1:
+                    try:
+                        with open("/proc/1/comm", "r") as f:
+                            systemd_name = f.read().strip()
+                        chain_parts.append(f"{systemd_name}(1)")
+                    except:
+                        chain_parts.append("systemd(1)")
+                break
+
+            current_pid = ppid
+
+        return "->".join(chain_parts)
+
+    # ── BPF 时间戳转换 ─────────────────────────────────────────────────
+    _boot_to_epoch_ns = 0
+    _last_boot_update = 0.0
+
+    def _get_boot_to_epoch_offset() -> int:
+        """计算 CLOCK_BOOTTIME → wall clock 的偏移量."""
+        nonlocal _boot_to_epoch_ns, _last_boot_update
+
+        now = time.time()
+        # 每分钟更新一次偏移量
+        if now - _last_boot_update > 60.0:
+            wall_ns = time.time_ns()
+
+            # 获取 boot time (使用 clock_gettime)
+            import ctypes
+            libc = ctypes.CDLL('libc.so.6', use_errno=True)
+
+            class Timespec(ctypes.Structure):
+                _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+            ts = Timespec()
+            # CLOCK_BOOTTIME = 7
+            libc.clock_gettime(7, ctypes.byref(ts))
+            boot_ns = ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+
+            _boot_to_epoch_ns = wall_ns - boot_ns
+            _last_boot_update = now
+
+        return _boot_to_epoch_ns
+
+    def _convert_bpf_timestamp(ts_ns: int) -> str:
+        """将 BPF boot time 转换为 ISO8601 字符串."""
         from datetime import datetime
-        now = datetime.now().isoformat()
+        offset = _get_boot_to_epoch_offset()
+        epoch_ns = ts_ns + offset
+        seconds = epoch_ns / 1_000_000_000
+        dt = datetime.fromtimestamp(seconds)
+        return dt.isoformat()
 
-        for (pid, comm), val in groups.items():
-            # 获取进程信息（每个 pid 只查询一次）
-            if pid not in process_info_cache:
-                process_info_cache[pid] = _get_process_info(pid)
-            proc_info = process_info_cache[pid]
+    # ── Action 推断 ─────────────────────────────────────────────────────
+    def _infer_action_from_type(event_type: str) -> str:
+        """从事件类型推断 action (Phase 1 简单映射)."""
+        action_map = {
+            "FILE": "open",
+            "NET": "connect",
+            "DNS": "resolve"
+        }
+        return action_map.get(event_type, "unknown")
 
-            entry = {
-                "ts": now,
+    # ── Object 字段格式化 ───────────────────────────────────────────────
+    def _format_object(event_type: str, data: str) -> tuple:
+        """根据事件类型格式化 object 字段，返回 (key, dict)."""
+        if event_type == "FILE":
+            return "file", {"path": data}
+        elif event_type == "NET":
+            if ":" in data and not data.startswith("family"):
+                return "network", {"dst": data, "family": "AF_INET"}
+            else:
+                return "network", {"dst": data, "family": data}
+        elif event_type == "DNS":
+            return "dns", {"query": data}
+        else:
+            return "unknown", {"raw": data}
+
+    # ── 单事件日志构建 ─────────────────────────────────────────────────
+    def _build_single_event_log(event: Dict) -> Dict:
+        """将单个 BPF 事件转换为 JSON-Audit 日志."""
+        # 时间戳转换
+        ts_ns = event.get("ts_ns", 0)
+        ts_iso = _convert_bpf_timestamp(ts_ns)
+
+        # 获取进程信息
+        pid = event.get("pid", 0)
+        proc_info = _get_process_info_cached(pid)
+
+        # 构建进程链
+        chain = _build_proc_chain(pid, comm=event.get("comm", ""))
+
+        # 确定 action
+        action = _infer_action_from_type(event.get("type", ""))
+
+        # 组装日志
+        log_entry = {
+            "ts": ts_iso,
+            "type": event.get("type", "UNKNOWN"),
+            "action": action,
+            "process": {
                 "pid": pid,
-                "comm": comm,
+                "comm": event.get("comm", ""),
+                "cmdline": proc_info.get("cmdline", ""),
+                "exe": proc_info.get("exe", ""),
+                "cwd": proc_info.get("cwd", ""),
+                "ppid": proc_info.get("ppid", 0),
+                "chain": chain
             }
+        }
 
-            # 添加进程详细信息
-            if proc_info.get("cmdline"):
-                entry["cmdline"] = proc_info["cmdline"]
-            if proc_info.get("exe"):
-                entry["exe"] = proc_info["exe"]
-            if proc_info.get("cwd"):
-                entry["cwd"] = proc_info["cwd"]
-            if proc_info.get("ppid"):
-                entry["ppid"] = proc_info["ppid"]
+        # 动态 object 字段
+        object_key, object_value = _format_object(event.get("type"), event.get("data"))
+        log_entry[object_key] = object_value
 
-            # 添加事件数据
-            if val["file_reads"]:
-                entry["file_reads"] = val["file_reads"]
-            if val["connects"]:
-                entry["connects"] = val["connects"]
-            if val["dns_queries"]:
-                entry["dns_queries"] = val["dns_queries"]
-
-            result.append(entry)
-        return result
+        return log_entry
 
     while _run_loop_flag:
         now = time.time()
@@ -262,7 +383,7 @@ def run_loop() -> None:
                     new_cfg = load_config(_CONFIG_PATH)
                     cfg.clear()
                     cfg.update(new_cfg)
-                    _logger.log_event({"event": "config_reloaded"})
+                    _runtime_logger.info("Config reloaded")
             except Exception:
                 pass
 
@@ -277,16 +398,17 @@ def run_loop() -> None:
         # Filter by process comm + event type rules
         events = filter_events(events, targets)
 
-        # Aggregate by process and write to JSONL log
-        aggregated = _aggregate_by_process(events)
-        for entry in aggregated:
-            _logger.log_event(entry)
+        # Process each event individually and write to JSONL log
+        for event in events:
+            log_entry = _build_single_event_log(event)
+            _logger.log_event(log_entry)
 
         time.sleep(poll_interval)
 
     # ── Shutdown ──────────────────────────────────────────────────────
-    _logger.log_event({"event": "daemon_stopping"})
+    _runtime_logger.info("Daemon stopping")
     _logger.close()
+    _runtime_logger.close()
     unload_bpf(_PIN_DIR)
     _remove_pid()
 
