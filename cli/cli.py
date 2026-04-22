@@ -165,7 +165,7 @@ def log_cmd(args) -> None:
         with open(log_path, encoding="utf-8") as f:
             lines = [line for line in f if args.grep in line]
     elif args.type_filter:
-        type_map = {"FILE": '"file_reads"', "NET": '"connects"', "DNS": '"dns_queries"'}
+        type_map = {"FILE": '"type": "FILE"', "NET": '"type": "NET"', "DNS": '"type": "DNS"'}
         marker = type_map.get(args.type_filter, '')
         with open(log_path, encoding="utf-8") as f:
             lines = [line for line in f if marker in line]
