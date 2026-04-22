@@ -1,0 +1,36 @@
+# Claude Code相关目录
+.claude/
+.qoder/
+openspec/
+
+# AGENTS文档
+AGENTS.md
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# eBPF编译产物（保留源码）
+*.o
+
+# C编译产物（保留源码）
+ebpf/bpf_map_dump
+
+# 日志文件
+*.log
+
+# PID文件
+*.pid
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

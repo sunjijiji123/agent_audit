@@ -1,0 +1,58 @@
+{
+  "log": {
+    "path": "/var/log/agent-audit/audit.log",
+    "max_size_mb": 50,
+    "backup_count": 5
+  },
+  "daemon": {
+    "poll_interval_sec": 2,
+    "bpf_elf": "/mnt/hgfs/code/1-ai/ai-ebpf-demo-cli/ebpf/audit.bpf.o",
+    "bpf_map_id": 13
+  },
+  "targets": [
+    {
+      "id": 1,
+      "process": "node",
+      "file": [
+        "/root/"
+      ],
+      "network": [],
+      "dns": [],
+      "enabled": true
+    },
+    {
+      "id": 2,
+      "process": "ls",
+      "file": [
+        "/root/"
+      ],
+      "network": [],
+      "dns": [],
+      "enabled": true
+    },
+    {
+      "id": 3,
+      "process": "python3",
+      "file": [
+        "/root/"
+      ],
+      "network": [
+        "127.0.0.1"
+      ],
+      "dns": [
+        "example.com"
+      ],
+      "enabled": true
+    },
+    {
+      "id": 4,
+      "process": "python3",
+      "file": [],
+      "network": [
+        "127.0.0.1:9999"
+      ],
+      "dns": [],
+      "enabled": true
+    }
+  ]
+}
