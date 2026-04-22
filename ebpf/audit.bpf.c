@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* eBPF audit program — simple tracepoint capture (user-space filtering)
+/* eBPF audit program — kernel-level comm whitelist filtering
  *
  * Monitors:
  *   sys_enter_openat    -> FILE events
  *   sys_enter_connect   -> NET events
+ *   getaddrinfo uprobe  -> DNS events
  *
- * User-space daemon filters by process comm.
+ * Kernel-space filters by process comm whitelist to reduce noise.
  */
 
 #include <linux/bpf.h>
@@ -31,6 +32,13 @@ struct {
     __uint(value_size, sizeof(struct audit_event));
 } events SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, char[MAX_COMM_LEN]);
+    __type(value, __u32);
+} comm_whitelist SEC(".maps");
+
 struct sys_enter_ctx {
     __u64 __unused;
     long id;
@@ -43,6 +51,12 @@ static __always_inline __u16 __bpf_ntohs(__u16 x) {
 
 SEC("tracepoint/syscalls/sys_enter_openat")
 int handle_openat(struct sys_enter_ctx *ctx) {
+    char comm[MAX_COMM_LEN];
+    bpf_get_current_comm(comm, MAX_COMM_LEN);
+
+    __u32 *allowed = bpf_map_lookup_elem(&comm_whitelist, comm);
+    if (!allowed) return 0;
+
     struct audit_event event = {};
     event.event_type   = EVENT_TYPE_FILE;
     event.pid          = bpf_get_current_pid_tgid() >> 32;
@@ -55,6 +69,12 @@ int handle_openat(struct sys_enter_ctx *ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_connect")
 int handle_connect(struct sys_enter_ctx *ctx) {
+    char comm[MAX_COMM_LEN];
+    bpf_get_current_comm(comm, MAX_COMM_LEN);
+
+    __u32 *allowed = bpf_map_lookup_elem(&comm_whitelist, comm);
+    if (!allowed) return 0;
+
     struct audit_event event = {};
     event.event_type   = EVENT_TYPE_NETWORK;
     event.pid          = bpf_get_current_pid_tgid() >> 32;
@@ -62,8 +82,6 @@ int handle_connect(struct sys_enter_ctx *ctx) {
     bpf_get_current_comm(event.comm, MAX_COMM_LEN);
 
     const void *addr = (const void *)ctx->args[1];
-
-    /* Copy raw sockaddr into data — user-space parses IP:port */
     bpf_probe_read(event.data, 16, addr);
 
     bpf_map_update_elem(&events, &event.timestamp_ns, &event, 0);
@@ -83,6 +101,12 @@ struct pt_regs {
 SEC("uprobe/lib/x86_64-linux-gnu/libc.so.6:getaddrinfo")
 int BPF_KPROBE(trace_getaddrinfo, const char *node, const char *service)
 {
+    char comm[MAX_COMM_LEN];
+    bpf_get_current_comm(comm, MAX_COMM_LEN);
+
+    __u32 *allowed = bpf_map_lookup_elem(&comm_whitelist, comm);
+    if (!allowed) return 0;
+
     struct audit_event event = {};
     event.event_type   = EVENT_TYPE_DNS;
     event.pid          = bpf_get_current_pid_tgid() >> 32;

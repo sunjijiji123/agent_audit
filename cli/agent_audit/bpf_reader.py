@@ -81,6 +81,20 @@ def get_map_id(before_ids: Optional[List[int]] = None) -> int:
     return all_ids[-1] if all_ids else -1
 
 
+def get_whitelist_map_id() -> int:
+    """Find the comm_whitelist map ID."""
+    r = subprocess.run(
+        ["python3", "-c",
+         "import subprocess,json;"
+         "d=json.loads(subprocess.run(['bpftool','-j','map','show'],"
+         "capture_output=True,text=True).stdout);"
+         "print(','.join(str(m['id']) for m in d if'comm_whitelist' in m.get('name','')))"],
+        capture_output=True, text=True, timeout=10,
+    )
+    all_ids = sorted(int(x) for x in r.stdout.strip().split(",") if x)
+    return all_ids[-1] if all_ids else -1
+
+
 # ── hex parsing ───────────────────────────────────────────────────────────────
 
 def parse_hex_byte(s: str) -> int:
@@ -265,6 +279,23 @@ def clear_map(map_id: int) -> bool:
                 capture_output=True, text=True, timeout=5,
             )
             deleted += 1
+        return True
+    except Exception:
+        return False
+
+
+def update_whitelist_map(map_id: int, comm: str) -> bool:
+    """Add a comm name to the whitelist map."""
+    try:
+        # Convert comm to 16-byte hex array (pad with zeros)
+        comm_bytes = comm.encode('utf-8')[:16].ljust(16, b'\x00')
+
+        # Build command: bpftool map update id <id> key <16 hex bytes> value <4 zeros>
+        cmd = ["bpftool", "map", "update", "id", str(map_id), "key"]
+        cmd.extend([f"0x{b:02x}" for b in comm_bytes])
+        cmd.extend(["value", "0", "0", "0", "0"])
+
+        subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         return True
     except Exception:
         return False

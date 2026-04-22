@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional, Set, Dict, Any
 
 from .config import load_config, save_config
-from .bpf_reader import load_bpf, get_map_id, fetch_events, deduplicate_events, unload_bpf, clear_map
+from .bpf_reader import load_bpf, get_map_id, get_whitelist_map_id, fetch_events, deduplicate_events, unload_bpf, clear_map, update_whitelist_map
 from .matcher import filter_events
 from .log_rotator import make_audit_logger, make_runtime_logger
 
@@ -20,6 +20,40 @@ _PIN_DIR = "/sys/fs/bpf/audit"
 _run_loop_flag = True
 _logger: Optional[object] = None
 _runtime_logger: Optional[object] = None
+
+
+# ── Whitelist management ───────────────────────────────────────────────────────
+
+def sync_whitelist_to_bpf(cfg: Dict[str, Any], runtime_logger: Optional[object] = None) -> bool:
+    """Sync comm whitelist from config to BPF map.
+
+    Returns True on success. Logs errors if runtime_logger provided.
+    """
+    whitelist_map_id = get_whitelist_map_id()
+    if whitelist_map_id < 0:
+        if runtime_logger:
+            runtime_logger.error("comm_whitelist map not found")
+        return False
+
+    targets = cfg.get("targets", [])
+    comm_list = [t["process"] for t in targets if t.get("enabled", True)]
+
+    if not comm_list:
+        if runtime_logger:
+            runtime_logger.error("No enabled targets in config — whitelist would be empty")
+        return False
+
+    # Clear existing whitelist
+    clear_map(whitelist_map_id)
+
+    # Write new whitelist entries
+    for comm in comm_list:
+        update_whitelist_map(whitelist_map_id, comm)
+
+    if runtime_logger:
+        runtime_logger.info(f"Whitelist synced to BPF: {comm_list}")
+
+    return True
 
 
 # ── PID file ────────────────────────────────────────────────────────────────────
@@ -152,6 +186,13 @@ def run_loop() -> None:
         _runtime_logger.info(f"BPF loaded: {bpf_elf}, targets: {process_names}")
     else:
         _runtime_logger.error(f"BPF load failed: {bpf_elf}")
+        _logger.close()
+        _runtime_logger.close()
+        return
+
+    # Sync whitelist to BPF map
+    if not sync_whitelist_to_bpf(cfg, _runtime_logger):
+        _runtime_logger.error("Whitelist sync failed — aborting")
         _logger.close()
         _runtime_logger.close()
         return
@@ -383,6 +424,7 @@ def run_loop() -> None:
                     new_cfg = load_config(_CONFIG_PATH)
                     cfg.clear()
                     cfg.update(new_cfg)
+                    sync_whitelist_to_bpf(cfg, _runtime_logger)
                     _runtime_logger.info("Config reloaded")
             except Exception:
                 pass

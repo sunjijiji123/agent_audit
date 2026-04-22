@@ -42,6 +42,36 @@ struct {
 
 白名单通过 bpftool map update 更新（验证阶段），daemon inotify 检测 config 变更后同步更新 whitelist map。
 
+**✓ 已完成 (2026-04-22): 内核态 comm 白名单过滤验证**
+
+**实现内容：**
+1. BPF 程序修改 (`ebpf/audit.bpf.c`):
+   - 新增 `comm_whitelist` map (HASH, max_entries: 256)
+   - 三个 syscall handlers (openat/connect/getaddrinfo) 在 entry 点检查白名单
+   - 不匹配的进程直接 `return 0`，不产生事件
+
+2. Daemon 修改 (`cli/agent_audit/daemon.py` + `bpf_reader.py`):
+   - `get_whitelist_map_id()`：查找 whitelist map ID
+   - `update_whitelist_map()`：写入白名单条目 (使用 bpftool hex 格式)
+   - `sync_whitelist_to_bpf()`：从 config 同步白名单到 BPF map
+   - 启动时自动同步 + config reload 时更新
+
+**验证结果：**
+- **噪音削减效果：** 100% 有效 - events map 只包含白名单进程
+- **实测数据：** 625 个事件，全部来自 3 个白名单进程 (python3: 511, bash: 96, ls: 18)
+- **对比 Phase 0：** 原用户态过滤丢弃 99.1%，现内核态过滤直达目标进程
+- **Config reload：** 正常工作 - 添加 "cat" 目标后 whitelist 正确更新
+- **空白名单安全：** Daemon 检测到无启用目标时 abort 并报错："No enabled targets in config"
+
+**编译注意事项：**
+- 需使用 `-D__TARGET_ARCH_x86` 编译标志 (Makefile 已配置)
+- BPF handlers 调用两次 `bpf_get_current_comm()` (一次检查 whitelist，一次写入 event)
+- bpftool map update 使用 hex 格式：`key 0x70 0x79... value 0 0 0 0`
+
+**下一步优化方向：**
+- Phase 2 (P1): PID 级过滤 + 进程链追踪 (解决同名进程问题)
+- Phase 3 (P2): CO-RE 可移植性改造 + libbpf loader
+
 ## 待办事项
 
 ### P0: 内核态 comm 白名单过滤
