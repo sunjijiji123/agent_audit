@@ -8,12 +8,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <asm/unistd.h>
 #include <linux/bpf.h>
 #include <errno.h>
-
-#ifndef __NR_bpf
-#define __NR_bpf 321
-#endif
 
 #define MAX_COMM  16
 #define MAX_DATA  256

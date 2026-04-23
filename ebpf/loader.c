@@ -67,7 +67,8 @@ static int g_is_musl = 0;
 static int discover_libc_path(void) {
     /* Common libc paths for different distributions */
     const char *paths[] = {
-        "/lib/x86_64-linux-gnu/libc.so.6",    /* Ubuntu/Debian */
+        "/lib/x86_64-linux-gnu/libc.so.6",    /* Ubuntu/Debian x86_64 */
+        "/lib/aarch64-linux-gnu/libc.so.6",   /* Ubuntu/Debian aarch64 */
         "/lib64/libc.so.6",                    /* RHEL/Fedora */
         "/lib/libc.so.6",                      /* Generic */
         "/usr/lib/libc.so.6",                  /* Arch */
@@ -75,7 +76,8 @@ static int discover_libc_path(void) {
     };
 
     /* Check musl first */
-    if (access("/lib/libc.musl-x86_64.so.1", R_OK) == 0) {
+    if (access("/lib/libc.musl-x86_64.so.1", R_OK) == 0 ||
+        access("/lib/libc.musl-aarch64.so.1", R_OK) == 0) {
         g_is_musl = 1;
         fprintf(stderr, "[loader] Detected musl environment (Alpine)\n");
         return -1;  /* Musl DNS uprobe not supported yet */

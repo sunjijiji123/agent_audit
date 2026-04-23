@@ -7,22 +7,27 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-# Path to config.json — relative to this file's parent project root
+# Project root (3 levels up from this file: config.py -> agent_audit -> cli -> root)
+_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Path to config.json — relative to project root
 _CONFIG_NAME = "config.json"
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / _CONFIG_NAME
+_CONFIG_PATH = _ROOT / _CONFIG_NAME
+
+# Default log path (single source of truth)
+DEFAULT_LOG_PATH = "/var/log/agent-audit/audit.log"
 
 DEFAULT_CONFIG = {
     "log": {
-        "path": "/var/log/agent-audit/audit.log",
+        "path": DEFAULT_LOG_PATH,
         "max_size_mb": 50,
         "backup_count": 5,
     },
     "daemon": {
         "poll_interval_sec": 2,
-        "bpf_elf": "/root/ai-ebpf-demo-cli/ebpf/audit.bpf.o",
-        "bpf_map_id": None,
+        "bpf_elf": str(_ROOT / "ebpf" / "audit.bpf.o"),
     },
-    "targets": [],
+    "agents": [],
 }
 
 
@@ -51,48 +56,36 @@ def save_config(cfg: dict, path: Optional[str] = None) -> None:
         raise
 
 
-def next_target_id(cfg: dict) -> int:
-    """Return next unused target id."""
-    existing = [t.get("id", 0) for t in cfg.get("targets", [])]
-    return max(existing) + 1 if existing else 1
-
-
-def add_target(
-    process: str,
-    file: Optional[list] = None,
-    network: Optional[list] = None,
-    dns: Optional[list] = None,
-    path: Optional[str] = None,
-) -> dict:
-    """Add a new audit target. Returns the updated config."""
+def add_agent(pid: int, path: Optional[str] = None) -> dict:
+    """Add an agent PID to config.agents. Returns updated config."""
     cfg = load_config(path)
-    new_id = next_target_id(cfg)
-    target = {
-        "id": new_id,
-        "process": process,
-        "file": file or [],
-        "network": network or [],
-        "dns": dns or [],
-        "enabled": True,
-    }
-    cfg.setdefault("targets", []).append(target)
+    agents = cfg.setdefault("agents", [])
+    if not any(a.get("pid") == pid for a in agents):
+        agents.append({"pid": pid})
+        save_config(cfg, path)
+    return cfg
+
+
+def del_agent(pid: int, path: Optional[str] = None) -> dict:
+    """Remove an agent PID from config.agents. Returns updated config."""
+    cfg = load_config(path)
+    cfg["agents"] = [a for a in cfg.get("agents", []) if a.get("pid") != pid]
     save_config(cfg, path)
     return cfg
 
 
-def del_target(process: str, path: Optional[str] = None) -> dict:
-    """Delete all targets matching process name. Returns updated config."""
+def list_agents(path: Optional[str] = None) -> list:
+    """Return all agent PIDs from config."""
     cfg = load_config(path)
-    original = len(cfg.get("targets", []))
-    cfg["targets"] = [t for t in cfg.get("targets", []) if t.get("process") != process]
+    return [a.get("pid") for a in cfg.get("agents", []) if a.get("pid")]
+
+
+def clear_agents(path: Optional[str] = None) -> dict:
+    """Clear all agents from config. Returns updated config."""
+    cfg = load_config(path)
+    cfg["agents"] = []
     save_config(cfg, path)
     return cfg
-
-
-def list_targets(path: Optional[str] = None) -> list:
-    """Return all enabled targets."""
-    cfg = load_config(path)
-    return [t for t in cfg.get("targets", []) if t.get("enabled", True)]
 
 
 def update_log_config(

@@ -199,9 +199,9 @@ int trace_getaddrinfo(struct pt_regs *ctx)
     bpf_get_current_comm(event->comm, MAX_COMM_LEN);
     pack_process_chain(pid, entry, event);
 
-    /* x86_64: first arg (node) in di register, offset 896 bits = 112 bytes */
+    /* Cross-arch: first arg (node) via PT_REGS_PARM1 */
     const char *node;
-    bpf_probe_read_kernel(&node, sizeof(node), (void *)ctx + 112);
+    bpf_probe_read_kernel(&node, sizeof(node), &PT_REGS_PARM1(ctx));
     bpf_probe_read_user_str(event->data, MAX_DATA_LEN, node);
 
     bpf_map_update_elem(&events, &event->timestamp_ns, event, 0);

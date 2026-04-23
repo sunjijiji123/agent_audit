@@ -5,14 +5,17 @@ import sys
 import time
 import signal
 import json
+import tempfile
 from pathlib import Path
 from typing import Optional, Set, Dict, Any
 
-from .config import load_config, save_config
-from .bpf_loader import load_bpf, register_pid, update_agent_tree, fetch_events, deduplicate_events, unload_bpf
+from .config import load_config, save_config, clear_agents, DEFAULT_LOG_PATH
+from .bpf_loader import load_bpf, register_pid, unregister_pid, update_agent_tree, fetch_events, deduplicate_events, unload_bpf
 from .log_rotator import make_audit_logger, make_runtime_logger
 
-_PID_FILE = "/root/tmp/agent-audit-daemon.pid"
+_PID_DIR = os.environ.get("AGENT_AUDIT_PID_DIR",
+                          os.path.join(tempfile.gettempdir(), "agent-audit"))
+_PID_FILE = os.path.join(_PID_DIR, "daemon.pid")
 _CONFIG_PATH = str(Path(__file__).resolve().parent.parent.parent / "config.json")
 _PIN_DIR = "/sys/fs/bpf/audit"
 
@@ -63,6 +66,7 @@ def register_agent_pid(pid: int, runtime_logger: Optional[object] = None) -> boo
 # ── PID file ────────────────────────────────────────────────────────────────────
 
 def _write_pid() -> None:
+    os.makedirs(_PID_DIR, exist_ok=True)
     with open(_PID_FILE, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
 
@@ -163,11 +167,18 @@ def run_loop() -> None:
 
     cfg = load_config(_CONFIG_PATH)
     log_cfg = cfg.get("log", {})
-    log_path = log_cfg.get("path", "/var/log/agent-audit/audit.log")
+    log_path = log_cfg.get("path", DEFAULT_LOG_PATH)
     max_size_mb = log_cfg.get("max_size_mb", 50)
     backup_count = log_cfg.get("backup_count", 5)
     poll_interval = cfg.get("daemon", {}).get("poll_interval_sec", 2)
     bpf_elf = cfg.get("daemon", {}).get("bpf_elf", "")
+
+    # Resolve relative paths against project root (config.json parent dir)
+    _project_root = str(Path(_CONFIG_PATH).parent)
+    if bpf_elf and not os.path.isabs(bpf_elf):
+        bpf_elf = os.path.join(_project_root, bpf_elf)
+    if log_path and not os.path.isabs(log_path):
+        log_path = os.path.join(_project_root, log_path)
 
     if not bpf_elf or not os.path.exists(bpf_elf):
         print(f"BPF ELF not found: {bpf_elf}", file=sys.stderr)
@@ -191,13 +202,17 @@ def run_loop() -> None:
         _runtime_logger.close()
         return
 
-    # Register Agent PIDs from config
-    agent_pids = cfg.get("agent_pids", [])
+    # Register Agent PIDs from config, then clear config.agents
+    agents = cfg.get("agents", [])
+    agent_pids = [a.get("pid") for a in agents if a.get("pid")]
     for pid in agent_pids:
         if not register_agent_pid(pid, _runtime_logger):
             _runtime_logger.error(f"Failed to register Agent PID {pid}")
 
-    _runtime_logger.info(f"Daemon started, agent_pids: {agent_pids}")
+    # Clear config.agents after reading (one-shot IPC mechanism)
+    clear_agents(_CONFIG_PATH)
+
+    _runtime_logger.info(f"Daemon started, registered {len(agent_pids)} agent PIDs: {agent_pids}")
 
     seen_events: Set[int] = set()
 
@@ -382,7 +397,7 @@ def run_loop() -> None:
     while _run_loop_flag:
         now = time.time()
 
-        # inotify config reload
+        # inotify config reload - handle agents IPC
         if inotify_fd is not None and (now - last_inotify_check) > 0.5:
             last_inotify_check = now
             try:
@@ -391,11 +406,23 @@ def run_loop() -> None:
                 if r:
                     os.read(inotify_fd, 4096)
                     new_cfg = load_config(_CONFIG_PATH)
+
+                    # Check for agents changes (add/remove via CLI)
+                    new_agents = new_cfg.get("agents", [])
+                    new_agent_pids = {a.get("pid") for a in new_agents if a.get("pid")}
+
+                    if new_agent_pids:
+                        # Register new agents
+                        for pid in new_agent_pids:
+                            register_agent_pid(pid, _runtime_logger)
+                        # Clear config.agents after processing
+                        clear_agents(_CONFIG_PATH)
+                        _runtime_logger.info(f"Config reloaded, registered {len(new_agent_pids)} new agent PIDs")
+
                     cfg.clear()
                     cfg.update(new_cfg)
-                    _runtime_logger.info("Config reloaded")
-            except Exception:
-                pass
+            except Exception as e:
+                _runtime_logger.warning(f"Config reload error: {e}")
 
         # Fetch events from BPF map
         events = fetch_events()
