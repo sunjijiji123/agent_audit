@@ -1,4 +1,4 @@
-"""Daemon runner — loads BPF, polls map, filters events, writes JSONL."""
+"""Daemon runner — loads BPF, polls map, writes JSONL with BPF-packed process chain."""
 
 import os
 import sys
@@ -9,8 +9,7 @@ from pathlib import Path
 from typing import Optional, Set, Dict, Any
 
 from .config import load_config, save_config
-from .bpf_reader import load_bpf, get_map_id, get_whitelist_map_id, fetch_events, deduplicate_events, unload_bpf, clear_map, update_whitelist_map
-from .matcher import filter_events
+from .bpf_loader import load_bpf, register_pid, fetch_events, deduplicate_events, unload_bpf
 from .log_rotator import make_audit_logger, make_runtime_logger
 
 _PID_FILE = "/root/tmp/agent-audit-daemon.pid"
@@ -22,36 +21,36 @@ _logger: Optional[object] = None
 _runtime_logger: Optional[object] = None
 
 
-# ── Whitelist management ───────────────────────────────────────────────────────
+# ── PID whitelist management ───────────────────────────────────────────────────────
 
-def sync_whitelist_to_bpf(cfg: Dict[str, Any], runtime_logger: Optional[object] = None) -> bool:
-    """Sync comm whitelist from config to BPF map.
+def register_agent_pid(pid: int, runtime_logger: Optional[object] = None) -> bool:
+    """Register Agent root PID into pid_whitelist map.
 
     Returns True on success. Logs errors if runtime_logger provided.
     """
-    whitelist_map_id = get_whitelist_map_id()
-    if whitelist_map_id < 0:
+    # Check PID exists
+    if not os.path.exists(f"/proc/{pid}"):
         if runtime_logger:
-            runtime_logger.error("comm_whitelist map not found")
+            runtime_logger.error(f"PID {pid} does not exist")
         return False
 
-    targets = cfg.get("targets", [])
-    comm_list = [t["process"] for t in targets if t.get("enabled", True)]
-
-    if not comm_list:
+    # Read comm from /proc
+    try:
+        with open(f"/proc/{pid}/comm", "r") as f:
+            comm = f.read().strip()
+    except FileNotFoundError:
         if runtime_logger:
-            runtime_logger.error("No enabled targets in config — whitelist would be empty")
+            runtime_logger.error(f"Cannot read /proc/{pid}/comm")
         return False
 
-    # Clear existing whitelist
-    clear_map(whitelist_map_id)
-
-    # Write new whitelist entries
-    for comm in comm_list:
-        update_whitelist_map(whitelist_map_id, comm)
+    # Write to pid_whitelist map via loader
+    if not register_pid(pid, root_pid=pid, depth=0):
+        if runtime_logger:
+            runtime_logger.error(f"Failed to update pid_whitelist for PID {pid}")
+        return False
 
     if runtime_logger:
-        runtime_logger.info(f"Whitelist synced to BPF: {comm_list}")
+        runtime_logger.info(f"Agent PID registered: {pid} (comm={comm})")
 
     return True
 
@@ -179,135 +178,25 @@ def run_loop() -> None:
     last_inotify_check = 0.0
 
     # ── Load BPF program ──────────────────────────────────────────────
-    targets = cfg.get("targets", [])
-    process_names = [t["process"] for t in targets if t.get("enabled", True)]
-
-    if load_bpf(bpf_elf, _PIN_DIR):
-        _runtime_logger.info(f"BPF loaded: {bpf_elf}, targets: {process_names}")
+    if load_bpf():
+        _runtime_logger.info("BPF loaded via libbpf skeleton")
     else:
-        _runtime_logger.error(f"BPF load failed: {bpf_elf}")
+        _runtime_logger.error("BPF load failed")
         _logger.close()
         _runtime_logger.close()
         return
 
-    # Sync whitelist to BPF map
-    if not sync_whitelist_to_bpf(cfg, _runtime_logger):
-        _runtime_logger.error("Whitelist sync failed — aborting")
-        _logger.close()
-        _runtime_logger.close()
-        return
+    # Register Agent PIDs from config
+    agent_pids = cfg.get("agent_pids", [])
+    for pid in agent_pids:
+        if not register_agent_pid(pid, _runtime_logger):
+            _runtime_logger.error(f"Failed to register Agent PID {pid}")
 
-    map_id = get_map_id()
-    if map_id < 0:
-        _runtime_logger.error("BPF map ID not found")
-        _logger.close()
-        _runtime_logger.close()
-        return
-
-    # Save map_id to config for reference
-    cfg.setdefault("daemon", {})["bpf_map_id"] = map_id
-    save_config(cfg, _CONFIG_PATH)
-
-    # Clear existing entries so we start fresh
-    clear_map(map_id)
-
-    _runtime_logger.info(f"Daemon started, map_id: {map_id}")
+    _runtime_logger.info(f"Daemon started, agent_pids: {agent_pids}")
 
     seen_events: Set[int] = set()
 
-    def _get_process_info(pid: int) -> Dict[str, Any]:
-        """读取进程详细信息（cmdline, exe, cwd）."""
-        info = {}
-        try:
-            # cmdline
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                cmdline = f.read().decode("utf-8", errors="replace").split("\x00")
-                info["cmdline"] = cmdline[0] if cmdline else ""
-
-            # exe
-            exe = os.readlink(f"/proc/{pid}/exe")
-            info["exe"] = exe
-
-            # cwd (working directory)
-            cwd = os.readlink(f"/proc/{pid}/cwd")
-            info["cwd"] = cwd
-
-            # ppid (parent pid)
-            with open(f"/proc/{pid}/stat", "r") as f:
-                stat = f.read().split()
-                info["ppid"] = int(stat[3]) if len(stat) > 3 else 0
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
-            # 进程已退出或无法访问
-            pass
-        return info
-
-    # ── 进程信息缓存 ───────────────────────────────────────────────────
-    _process_info_cache: Dict[int, Dict] = {}
-    _cache_timestamps: Dict[int, float] = {}
-    _CACHE_TTL = 5.0  # 5秒缓存有效期
-
-    def _get_process_info_cached(pid: int) -> Dict[str, Any]:
-        """带缓存的进程信息获取，减少重复 /proc 读取."""
-        now = time.time()
-        if pid in _process_info_cache:
-            cache_time = _cache_timestamps.get(pid, 0)
-            if now - cache_time < _CACHE_TTL:
-                return _process_info_cache[pid]
-        info = _get_process_info(pid)
-        _process_info_cache[pid] = info
-        _cache_timestamps[pid] = now
-        return info
-
-    # ── 进程链构建 ─────────────────────────────────────────────────────
-    def _build_proc_chain(pid: int, max_depth: int = 10, comm: str = "") -> str:
-        """构建进程链: 'python3(56105)->bash(1000)->systemd(1)'"""
-        chain_parts = []
-        current_pid = pid
-        visited = set()
-        first = True
-
-        for _ in range(max_depth):
-            if current_pid <= 0 or current_pid in visited:
-                break
-            visited.add(current_pid)
-
-            # 获取进程名（首次尝试使用 BPF 事件中的 comm）
-            if first and comm:
-                name = comm
-                first = False
-            else:
-                try:
-                    with open(f"/proc/{current_pid}/comm", "r") as f:
-                        name = f.read().strip()
-                except FileNotFoundError:
-                    name = "unknown"
-
-            chain_parts.append(f"{name}({current_pid})")
-
-            # 获取父进程PID
-            try:
-                with open(f"/proc/{current_pid}/stat", "r") as f:
-                    stat_fields = f.read().split()
-                    ppid = int(stat_fields[3]) if len(stat_fields) > 3 else 0
-            except FileNotFoundError:
-                ppid = 0
-
-            # 到达 systemd 或 kernel
-            if ppid <= 1:
-                if ppid == 1:
-                    try:
-                        with open("/proc/1/comm", "r") as f:
-                            systemd_name = f.read().strip()
-                        chain_parts.append(f"{systemd_name}(1)")
-                    except:
-                        chain_parts.append("systemd(1)")
-                break
-
-            current_pid = ppid
-
-        return "->".join(chain_parts)
-
-    # ── BPF 时间戳转换 ─────────────────────────────────────────────────
+    # ── BPF timestamp conversion ─────────────────────────────────────────────────
     _boot_to_epoch_ns = 0
     _last_boot_update = 0.0
 
@@ -378,12 +267,12 @@ def run_loop() -> None:
         ts_ns = event.get("ts_ns", 0)
         ts_iso = _convert_bpf_timestamp(ts_ns)
 
-        # 获取进程信息
+        # 获取PID和进程名
         pid = event.get("pid", 0)
-        proc_info = _get_process_info_cached(pid)
+        comm = event.get("comm", "")
 
-        # 构建进程链
-        chain = _build_proc_chain(pid, comm=event.get("comm", ""))
+        # BPF已打包完整进程链
+        chain = event.get("chain", [])
 
         # 确定 action
         action = _infer_action_from_type(event.get("type", ""))
@@ -395,12 +284,9 @@ def run_loop() -> None:
             "action": action,
             "process": {
                 "pid": pid,
-                "comm": event.get("comm", ""),
-                "cmdline": proc_info.get("cmdline", ""),
-                "exe": proc_info.get("exe", ""),
-                "cwd": proc_info.get("cwd", ""),
-                "ppid": proc_info.get("ppid", 0),
-                "chain": chain
+                "comm": comm,
+                "chain": chain,
+                "chain_depth": event.get("chain_depth", 0)
             }
         }
 
@@ -424,21 +310,15 @@ def run_loop() -> None:
                     new_cfg = load_config(_CONFIG_PATH)
                     cfg.clear()
                     cfg.update(new_cfg)
-                    sync_whitelist_to_bpf(cfg, _runtime_logger)
                     _runtime_logger.info("Config reloaded")
             except Exception:
                 pass
 
-        targets = cfg.get("targets", [])
-
         # Fetch events from BPF map
-        events = fetch_events(map_id)
+        events = fetch_events()
 
         # Deduplicate by timestamp_ns
         events, seen_events = deduplicate_events(events, seen_events)
-
-        # Filter by process comm + event type rules
-        events = filter_events(events, targets)
 
         # Process each event individually and write to JSONL log
         for event in events:
@@ -451,7 +331,7 @@ def run_loop() -> None:
     _runtime_logger.info("Daemon stopping")
     _logger.close()
     _runtime_logger.close()
-    unload_bpf(_PIN_DIR)
+    unload_bpf()
     _remove_pid()
 
 
