@@ -54,6 +54,12 @@ class _BPFLoaderLib:
             cls._lib.bpf_map_delete_pid_whitelist.restype = ctypes.c_int
             cls._lib.bpf_map_delete_pid_whitelist.argtypes = [ctypes.c_uint]
 
+            cls._lib.bpf_map_update_agent_tree.restype = ctypes.c_int
+            cls._lib.bpf_map_update_agent_tree.argtypes = [
+                ctypes.c_uint,      # pid
+                ctypes.c_char_p,    # comm
+            ]
+
             cls._lib.bpf_dump_events.restype = ctypes.c_char_p
             cls._lib.bpf_dump_events.argtypes = []
 
@@ -144,6 +150,28 @@ def unregister_pid(pid: int) -> bool:
 
     try:
         return lib.bpf_map_delete_pid_whitelist(ctypes.c_uint(pid)) == 0
+    except Exception:
+        return False
+
+
+def update_agent_tree(pid: int, comm: str) -> bool:
+    """Add a PID to agent_tree map (for root process chain tracking).
+
+    Args:
+        pid: The PID to add
+        comm: Process name (max 16 chars)
+
+    Returns True on success.
+    """
+    lib = _BPFLoaderLib.get()
+    if not lib:
+        return False
+
+    try:
+        return lib.bpf_map_update_agent_tree(
+            ctypes.c_uint(pid),
+            comm.encode("utf-8"),
+        ) == 0
     except Exception:
         return False
 

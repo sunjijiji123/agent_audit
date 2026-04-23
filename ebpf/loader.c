@@ -32,6 +32,12 @@ struct whitelist_entry {
     unsigned char depth;
 };
 
+struct tree_node {
+    unsigned int parent_pid;
+    char comm[16];
+    unsigned long long fork_time;
+};
+
 struct audit_event {
     unsigned int event_type;
     unsigned int pid;
@@ -45,6 +51,7 @@ struct audit_event {
 /* Global state */
 static struct bpf_object *g_obj = NULL;
 static int g_pid_whitelist_fd = -1;
+static int g_agent_tree_fd = -1;
 static int g_events_fd = -1;
 static char g_libc_path[512] = {0};
 static int g_is_musl = 0;
@@ -149,10 +156,13 @@ int bpf_load(void) {
 
     /* Cache map FDs */
     g_pid_whitelist_fd = bpf_object__find_map_fd_by_name(g_obj, "pid_whitelist");
+    g_agent_tree_fd = bpf_object__find_map_fd_by_name(g_obj, "agent_tree");
     g_events_fd = bpf_object__find_map_fd_by_name(g_obj, "events");
 
     if (g_pid_whitelist_fd < 0)
         fprintf(stderr, "[loader] Warning: pid_whitelist map not found\n");
+    if (g_agent_tree_fd < 0)
+        fprintf(stderr, "[loader] Warning: agent_tree map not found\n");
     if (g_events_fd < 0)
         fprintf(stderr, "[loader] Warning: events map not found\n");
 
@@ -168,6 +178,7 @@ void bpf_unload(void) {
         bpf_object__close(g_obj);
         g_obj = NULL;
         g_pid_whitelist_fd = -1;
+        g_agent_tree_fd = -1;
         g_events_fd = -1;
         fprintf(stderr, "[loader] BPF program unloaded\n");
     }
@@ -210,6 +221,28 @@ int bpf_map_delete_pid_whitelist(unsigned int pid) {
     err = bpf_map_delete_elem(g_pid_whitelist_fd, &pid);
     if (err && err != -ENOENT) {
         fprintf(stderr, "[loader] Failed to delete pid whitelist entry: %d\n", err);
+        return err;
+    }
+
+    return 0;
+}
+
+int bpf_map_update_agent_tree(unsigned int pid, const char *comm) {
+    struct tree_node node;
+    int err;
+
+    if (!g_obj || g_agent_tree_fd < 0) {
+        fprintf(stderr, "[loader] BPF not loaded or agent_tree not found\n");
+        return -1;
+    }
+
+    memset(&node, 0, sizeof(node));
+    node.parent_pid = pid;  /* root: parent_pid = self */
+    if (comm) strncpy(node.comm, comm, sizeof(node.comm) - 1);
+
+    err = bpf_map_update_elem(g_agent_tree_fd, &pid, &node, BPF_ANY);
+    if (err) {
+        fprintf(stderr, "[loader] Failed to update agent_tree: %d\n", err);
         return err;
     }
 
