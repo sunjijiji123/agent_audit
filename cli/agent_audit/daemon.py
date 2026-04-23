@@ -285,13 +285,49 @@ def run_loop() -> None:
             parts.append(f"{node['comm']}({node['pid']})")
         return "->".join(parts)
 
+    # ── fd/bytes 解析 ──────────────────────────────────────────────────
+    def _parse_fd_bytes(data: str) -> tuple:
+        """解析 'fd=X bytes=Y' 格式, 返回 (fd, bytes)."""
+        fd, nbytes = -1, 0
+        for part in data.split():
+            if part.startswith("fd="):
+                try:
+                    fd = int(part[3:])
+                except ValueError:
+                    pass
+            elif part.startswith("bytes="):
+                try:
+                    nbytes = int(part[6:])
+                except ValueError:
+                    pass
+        return fd, nbytes
+
+    # ── fd 路径解析 ─────────────────────────────────────────────────────
+    def _resolve_fd_path(pid: int, fd: int) -> str:
+        """从 /proc/{pid}/fd/{fd} 解析文件路径."""
+        try:
+            return os.readlink(f"/proc/{pid}/fd/{fd}")
+        except (OSError, PermissionError):
+            return ""
+
     # ── Object 字段格式化 ───────────────────────────────────────────────
-    def _format_object(event_type: str, data: str) -> tuple:
-        """根据事件类型格式化 object 字段，返回 (key, dict)."""
+    def _format_object(event_type: str, action: str, data: str, pid: int) -> tuple:
+        """根据事件类型和 action 格式化 object 字段，返回 (key, dict)."""
         if event_type == "FILE":
-            return "file", {"path": data}
+            if action in ("read", "write"):
+                # data = "fd=X bytes=Y"
+                fd, nbytes = _parse_fd_bytes(data)
+                path = _resolve_fd_path(pid, fd) if fd >= 0 else ""
+                return "file", {"fd": fd, "bytes": nbytes, "path": path}
+            else:
+                # open 事件, data = 文件路径
+                return "file", {"path": data}
         elif event_type == "NET":
-            # C loader 输出格式: "AF_INET 192.168.5.1:80" 或 "AF_INET6 [...]:port"
+            if action in ("send", "recv"):
+                # data = "fd=X bytes=Y"
+                fd, nbytes = _parse_fd_bytes(data)
+                return "network", {"fd": fd, "bytes": nbytes}
+            # connect 事件: C loader 输出 "AF_INET ip:port" 或 "AF_INET6 [...]:port"
             if data.startswith("AF_INET6"):
                 addr = data[len("AF_INET6 "):]
                 return "network", {"dst": addr, "family": "AF_INET6"}
@@ -320,7 +356,8 @@ def run_loop() -> None:
         # /proc 进程信息
         proc_info = _read_proc_info(pid)
 
-        action = _infer_action_from_type(event.get("type", ""))
+        # 优先使用 BPF 传来的 action 字段，fallback 到 type 推断
+        action = event.get("action") or _infer_action_from_type(event.get("type", ""))
 
         log_entry = {
             "ts": ts_iso,
@@ -337,7 +374,7 @@ def run_loop() -> None:
             }
         }
 
-        object_key, object_value = _format_object(event.get("type"), event.get("data"))
+        object_key, object_value = _format_object(event.get("type"), action, event.get("data", ""), pid)
         log_entry[object_key] = object_value
 
         return log_entry

@@ -40,6 +40,7 @@ struct tree_node {
 
 struct audit_event {
     unsigned int event_type;
+    unsigned int action_type;
     unsigned int pid;
     unsigned long long timestamp_ns;
     char comm[MAX_COMM_LEN];
@@ -340,10 +341,21 @@ const char *bpf_dump_events(void) {
             case 3: type_str = "DNS"; break;
         }
 
+        const char *action_str = "unknown";
+        switch (event.action_type) {
+            case 0: action_str = "open"; break;
+            case 1: action_str = "read"; break;
+            case 2: action_str = "write"; break;
+            case 3: action_str = "connect"; break;
+            case 4: action_str = "send"; break;
+            case 5: action_str = "recv"; break;
+            case 6: action_str = "resolve"; break;
+        }
+
         json_escape_string(event.comm, escaped, sizeof(escaped));
         snprintf(buf, sizeof(buf),
-            "{\"type\":\"%s\",\"pid\":%u,\"ts_ns\":%llu,\"comm\":\"%s\",\"chain_depth\":%d,\"chain\":[",
-            type_str, event.pid, event.timestamp_ns, escaped, event.chain_depth);
+            "{\"type\":\"%s\",\"action\":\"%s\",\"pid\":%u,\"ts_ns\":%llu,\"comm\":\"%s\",\"chain_depth\":%d,\"chain\":[",
+            type_str, action_str, event.pid, event.timestamp_ns, escaped, event.chain_depth);
         json_append(buf);
 
         for (int i = 0; i < event.chain_depth; i++) {
@@ -354,12 +366,12 @@ const char *bpf_dump_events(void) {
         }
 
         json_append("],\"data\":\"");
-        if (event.event_type == 2) {
-            /* NET event: data is raw sockaddr — parse to readable string */
+        if (event.event_type == 2 && event.action_type == 3) {
+            /* NET connect: data is raw sockaddr — parse to readable string */
             _format_sockaddr(event.data, buf, sizeof(buf));
             json_append(buf);
         } else {
-            /* FILE/DNS events: data is already a string */
+            /* FILE/DNS/send/recv events: data is already a formatted string */
             json_escape_string(event.data, escaped, sizeof(escaped));
             json_append(escaped);
         }
