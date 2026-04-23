@@ -17,12 +17,20 @@
 
 #define MAX_COMM  16
 #define MAX_DATA  256
+#define MAX_CHAIN_DEPTH 8
+
+struct chain_node {
+    __u32 pid;
+    char comm[MAX_COMM];
+};
 
 struct audit_event {
     __u32 event_type;
     __u32 pid;
     __u64 timestamp_ns;
     char comm[MAX_COMM];
+    __u8 chain_depth;
+    struct chain_node chain[MAX_CHAIN_DEPTH];
     char data[MAX_DATA];
 };
 
@@ -101,6 +109,21 @@ int main(int argc, char **argv)
                 case 3: ts = "DNS";  break;
                 default: ts = "UNKNOWN"; break;
             }
+
+            // Build JSON output
+            printf("{\"type\":\"%s\",\"pid\":%u,\"ts_ns\":%lu,\"comm\":\"%s\",\"chain_depth\":%u,\"chain\":[",
+                   ts, value.pid, (unsigned long)value.timestamp_ns,
+                   value.comm, value.chain_depth);
+
+            // Output chain nodes
+            for (int i = 0; i < value.chain_depth && i < MAX_CHAIN_DEPTH; i++) {
+                if (i > 0) printf(",");
+                printf("{\"pid\":%u,\"comm\":\"%s\"}",
+                       value.chain[i].pid, value.chain[i].comm);
+            }
+
+            printf("],\"data\":");
+
             if (value.event_type == 2) {
                 /* NET: parse raw sockaddr into IP:port */
                 unsigned char *sa = (unsigned char *)value.data;
@@ -113,12 +136,12 @@ int main(int argc, char **argv)
                 } else {
                     snprintf(esc, sizeof(esc), "\"family(%u)\"", family);
                 }
+                printf("%s}\n", esc);
             } else {
                 json_write_str(esc, value.data, MAX_DATA);
+                printf("%s}\n", esc);
             }
-            printf("{\"type\":\"%s\",\"pid\":%u,\"ts_ns\":%lu,\"comm\":\"%s\",\"data\":%s}\n",
-                   ts, value.pid, (unsigned long)value.timestamp_ns,
-                   value.comm, esc);
+
             count++;
             fflush(stdout);
         }

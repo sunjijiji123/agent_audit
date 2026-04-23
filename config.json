@@ -5,74 +5,8 @@
     "backup_count": 5
   },
   "daemon": {
-    "poll_interval_sec": 2,
-    "bpf_elf": "/mnt/hgfs/code/1-ai/ai-ebpf-demo-cli/ebpf/audit.bpf.o",
-    "bpf_map_id": 66
+    "poll_interval_sec": 1,
+    "bpf_elf": "/mnt/hgfs/code/1-ai/ai-ebpf-demo-cli/ebpf/audit.bpf.o"
   },
-  "targets": [
-    {
-      "id": 1,
-      "process": "node",
-      "file": [
-        "/root/"
-      ],
-      "network": [],
-      "dns": [],
-      "enabled": true
-    },
-    {
-      "id": 3,
-      "process": "python3",
-      "file": [
-        "/root/"
-      ],
-      "network": [
-        "127.0.0.1"
-      ],
-      "dns": [
-        "example.com"
-      ],
-      "enabled": true
-    },
-    {
-      "id": 4,
-      "process": "python3",
-      "file": [],
-      "network": [
-        "127.0.0.1:9999"
-      ],
-      "dns": [],
-      "enabled": true
-    },
-    {
-      "id": 5,
-      "process": "bash",
-      "file": [
-        "/tmp/"
-      ],
-      "network": [],
-      "dns": [],
-      "enabled": true
-    },
-    {
-      "id": 6,
-      "process": "curl",
-      "file": [],
-      "network": [
-        "192.168.5.1"
-      ],
-      "dns": [],
-      "enabled": true
-    },
-    {
-      "id": 7,
-      "process": "ls",
-      "file": [
-        "/root/"
-      ],
-      "network": [],
-      "dns": [],
-      "enabled": true
-    }
-  ]
+  "agent_pids": []
 }

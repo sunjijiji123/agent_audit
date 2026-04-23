@@ -81,14 +81,14 @@ def get_map_id(before_ids: Optional[List[int]] = None) -> int:
     return all_ids[-1] if all_ids else -1
 
 
-def get_whitelist_map_id() -> int:
-    """Find the comm_whitelist map ID."""
+def get_pid_whitelist_map_id() -> int:
+    """Find the pid_whitelist map ID."""
     r = subprocess.run(
         ["python3", "-c",
          "import subprocess,json;"
          "d=json.loads(subprocess.run(['bpftool','-j','map','show'],"
          "capture_output=True,text=True).stdout);"
-         "print(','.join(str(m['id']) for m in d if'comm_whitelist' in m.get('name','')))"],
+         "print(','.join(str(m['id']) for m in d if'pid_whitelist' in m.get('name','')))"],
         capture_output=True, text=True, timeout=10,
     )
     all_ids = sorted(int(x) for x in r.stdout.strip().split(",") if x)
@@ -164,20 +164,33 @@ def parse_hex_dump(text: str) -> List[Dict]:
 
 
 def _parse_event_bytes(value: bytes) -> Optional[Dict]:
-    """Parse 288-byte BPF event struct into dict."""
-    if len(value) < 36:
+    """Parse BPF event struct (with chain) into dict."""
+    if len(value) < 193:
         return None
+
     import struct
+
+    # Parse header fields
     event_type = struct.unpack_from("<I", value, 0)[0]
     pid = struct.unpack_from("<I", value, 4)[0]
     ts_ns = struct.unpack_from("<Q", value, 8)[0]
     comm = value[16:32].rstrip(b"\x00").decode("utf-8", errors="replace")
+    chain_depth = value[32]
+
+    # Parse chain nodes (8 nodes max, each 20 bytes: u32 pid + char[16] comm)
+    chain = []
+    for i in range(min(chain_depth, 8)):
+        offset = 33 + i * 20
+        chain_pid = struct.unpack_from("<I", value, offset)[0]
+        chain_comm = value[offset + 4:offset + 20].rstrip(b"\x00").decode("utf-8", errors="replace")
+        chain.append({"pid": chain_pid, "comm": chain_comm})
 
     type_map = {1: "FILE", 2: "NET", 3: "DNS"}
     type_str = type_map.get(event_type, f"UNKNOWN({event_type})")
 
+    # Parse data field (starts at offset 193)
     if type_str == "NET":
-        data_bytes = value[32:]
+        data_bytes = value[193:209]  # First 16 bytes for network
         if len(data_bytes) >= 16:
             family = struct.unpack_from("<H", data_bytes, 0)[0]
             if family == 2:  # AF_INET
@@ -189,7 +202,7 @@ def _parse_event_bytes(value: bytes) -> Optional[Dict]:
         else:
             data_str = ""
     else:
-        data = value[32:].rstrip(b"\x00")
+        data = value[193:].rstrip(b"\x00")
         try:
             data_str = data.decode("utf-8", errors="replace")
         except Exception:
@@ -200,6 +213,8 @@ def _parse_event_bytes(value: bytes) -> Optional[Dict]:
         "pid": pid,
         "ts_ns": ts_ns,
         "comm": comm,
+        "chain_depth": chain_depth,
+        "chain": chain,
         "data": data_str,
     }
 
@@ -284,16 +299,22 @@ def clear_map(map_id: int) -> bool:
         return False
 
 
-def update_whitelist_map(map_id: int, comm: str) -> bool:
-    """Add a comm name to the whitelist map."""
+def update_pid_whitelist_map(map_id: int, pid: int, root_pid: int, depth: int) -> bool:
+    """Add a PID to the whitelist map with metadata."""
     try:
-        # Convert comm to 16-byte hex array (pad with zeros)
-        comm_bytes = comm.encode('utf-8')[:16].ljust(16, b'\x00')
+        import struct
 
-        # Build command: bpftool map update id <id> key <16 hex bytes> value <4 zeros>
+        # Pack whitelist_entry struct: {root_pid: u32, depth: u8}
+        value_bytes = struct.pack("<IB", root_pid, depth)
+
+        # Pack PID as key (u32)
+        key_bytes = struct.pack("<I", pid)
+
+        # Build command: bpftool map update id <id> key <hex> value <hex>
         cmd = ["bpftool", "map", "update", "id", str(map_id), "key"]
-        cmd.extend([f"0x{b:02x}" for b in comm_bytes])
-        cmd.extend(["value", "0", "0", "0", "0"])
+        cmd.extend([f"0x{b:02x}" for b in key_bytes])
+        cmd.extend(["value"])
+        cmd.extend([f"0x{b:02x}" for b in value_bytes])
 
         subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         return True
