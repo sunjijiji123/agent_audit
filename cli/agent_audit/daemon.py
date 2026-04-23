@@ -179,7 +179,7 @@ def run_loop() -> None:
 
     # ── Load BPF program ──────────────────────────────────────────────
     if load_bpf():
-        _runtime_logger.info("BPF loaded via libbpf skeleton")
+        _runtime_logger.info("BPF loaded via libbpf")
     else:
         _runtime_logger.error("BPF load failed")
         _logger.close()

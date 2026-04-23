@@ -1,4 +1,4 @@
-/* eBPF loader — libbpf skeleton based loader for audit BPF program
+/* eBPF loader — libbpf loader for audit BPF program
  *
  * Provides:
  *   - BPF program load/attach/unload
@@ -16,8 +16,6 @@
 #include <errno.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
-
-#include "audit.skel.h"
 
 /* Match BPF struct definitions */
 #define MAX_COMM_LEN      16
@@ -44,8 +42,10 @@ struct audit_event {
     char data[MAX_DATA_LEN];
 };
 
-/* Global skeleton instance */
-static struct audit_bpf *g_skel = NULL;
+/* Global state */
+static struct bpf_object *g_obj = NULL;
+static int g_pid_whitelist_fd = -1;
+static int g_events_fd = -1;
 static char g_libc_path[512] = {0};
 static int g_is_musl = 0;
 
@@ -103,32 +103,60 @@ static int discover_libc_path(void) {
  * BPF load/attach/unload
  * ============================================================ */
 
+/* Default BPF object path — set via bpf_set_elf_path() or use env BPF_ELF_PATH */
+static char g_elf_path[512] = "/mnt/hgfs/code/1-ai/ai-ebpf-demo-cli/ebpf/audit.bpf.o";
+
+void bpf_set_elf_path(const char *path) {
+    if (path) strncpy(g_elf_path, path, sizeof(g_elf_path) - 1);
+}
+
 int bpf_load(void) {
     struct bpf_program *prog;
+    struct bpf_link *link;
     int err;
 
-    if (g_skel) {
+    if (g_obj) {
         fprintf(stderr, "[loader] Already loaded\n");
         return 0;
     }
 
-    /* Open and load BPF skeleton */
-    g_skel = audit_bpf__open_and_load();
-    if (!g_skel) {
-        fprintf(stderr, "[loader] Failed to open BPF skeleton: %s\n", strerror(errno));
+    /* Open BPF object file — same as bpftool prog loadall */
+    g_obj = bpf_object__open_file(g_elf_path, NULL);
+    if (!g_obj) {
+        fprintf(stderr, "[loader] Failed to open BPF object: %s\n", strerror(errno));
         return -1;
     }
 
-    /* Auto-attach tracepoints (handled by skeleton) */
-    err = audit_bpf__attach(g_skel);
+    /* Load into kernel — triggers verifier */
+    err = bpf_object__load(g_obj);
     if (err) {
-        /* Some tracepoints may fail to attach due to permissions - log warning and continue */
-        fprintf(stderr, "[loader] Warning: Some programs failed to attach (err=%d), but BPF loaded\n", err);
+        fprintf(stderr, "[loader] Failed to load BPF object: %d\n", err);
+        bpf_object__close(g_obj);
+        g_obj = NULL;
+        return -1;
     }
 
-    /* Manually attach DNS uprobe if libc found
-     * Note: SEC("uprobe/...") auto-attach is still enabled in BPF code
-     * This is fallback for different libc paths */
+    /* Auto-attach all programs */
+    bpf_object__for_each_program(prog, g_obj) {
+        link = bpf_program__attach(prog);
+        if (!link) {
+            fprintf(stderr, "[loader] Warning: failed to attach %s: %s\n",
+                    bpf_program__name(prog), strerror(errno));
+        } else {
+            fprintf(stderr, "[loader] Attached: %s\n", bpf_program__name(prog));
+        }
+    }
+
+    /* Cache map FDs */
+    g_pid_whitelist_fd = bpf_object__find_map_fd_by_name(g_obj, "pid_whitelist");
+    g_events_fd = bpf_object__find_map_fd_by_name(g_obj, "events");
+
+    if (g_pid_whitelist_fd < 0)
+        fprintf(stderr, "[loader] Warning: pid_whitelist map not found\n");
+    if (g_events_fd < 0)
+        fprintf(stderr, "[loader] Warning: events map not found\n");
+
+    /* Discover libc for DNS uprobe */
     discover_libc_path();
 
     fprintf(stderr, "[loader] BPF program loaded and attached successfully\n");
@@ -136,9 +164,11 @@ int bpf_load(void) {
 }
 
 void bpf_unload(void) {
-    if (g_skel) {
-        audit_bpf__destroy(g_skel);
-        g_skel = NULL;
+    if (g_obj) {
+        bpf_object__close(g_obj);
+        g_obj = NULL;
+        g_pid_whitelist_fd = -1;
+        g_events_fd = -1;
         fprintf(stderr, "[loader] BPF program unloaded\n");
     }
 }
@@ -149,16 +179,10 @@ void bpf_unload(void) {
 
 int bpf_map_update_pid_whitelist(unsigned int pid, unsigned int root_pid, unsigned char depth) {
     struct whitelist_entry entry;
-    int map_fd, err;
+    int err;
 
-    if (!g_skel) {
+    if (!g_obj || g_pid_whitelist_fd < 0) {
         fprintf(stderr, "[loader] BPF not loaded\n");
-        return -1;
-    }
-
-    map_fd = bpf_map__fd(g_skel->maps.pid_whitelist);
-    if (map_fd < 0) {
-        fprintf(stderr, "[loader] Invalid map fd\n");
         return -1;
     }
 
@@ -166,7 +190,7 @@ int bpf_map_update_pid_whitelist(unsigned int pid, unsigned int root_pid, unsign
     entry.root_pid = root_pid;
     entry.depth = depth;
 
-    err = bpf_map_update_elem(map_fd, &pid, &entry, BPF_ANY);
+    err = bpf_map_update_elem(g_pid_whitelist_fd, &pid, &entry, BPF_ANY);
     if (err) {
         fprintf(stderr, "[loader] Failed to update pid whitelist: %d\n", err);
         return err;
@@ -176,19 +200,14 @@ int bpf_map_update_pid_whitelist(unsigned int pid, unsigned int root_pid, unsign
 }
 
 int bpf_map_delete_pid_whitelist(unsigned int pid) {
-    int map_fd, err;
+    int err;
 
-    if (!g_skel) {
+    if (!g_obj || g_pid_whitelist_fd < 0) {
         fprintf(stderr, "[loader] BPF not loaded\n");
         return -1;
     }
 
-    map_fd = bpf_map__fd(g_skel->maps.pid_whitelist);
-    if (map_fd < 0) {
-        return -1;
-    }
-
-    err = bpf_map_delete_elem(map_fd, &pid);
+    err = bpf_map_delete_elem(g_pid_whitelist_fd, &pid);
     if (err && err != -ENOENT) {
         fprintf(stderr, "[loader] Failed to delete pid whitelist entry: %d\n", err);
         return err;
@@ -226,32 +245,56 @@ static void json_escape_string(const char *str, char *out, int out_size) {
     out[j] = 0;
 }
 
+/* Parse raw sockaddr bytes into readable string.
+ * Handles AF_INET (IPv4) and AF_INET6 (IPv6). */
+static void _format_sockaddr(const char *data, char *out, int out_size) {
+    if (!data || out_size < 16) {
+        snprintf(out, out_size, "(empty)");
+        return;
+    }
+
+    unsigned short family = *(const unsigned short *)data;
+
+    if (family == 2) { /* AF_INET */
+        unsigned short port = *(const unsigned short *)(data + 2);
+        port = ((port & 0xff) << 8) | ((port >> 8) & 0xff); /* ntohs */
+        const unsigned char *addr = (const unsigned char *)(data + 4);
+        snprintf(out, out_size, "AF_INET %u.%u.%u.%u:%u",
+                 addr[0], addr[1], addr[2], addr[3], port);
+    } else if (family == 10) { /* AF_INET6 */
+        unsigned short port = *(const unsigned short *)(data + 2);
+        port = ((port & 0xff) << 8) | ((port >> 8) & 0xff); /* ntohs */
+        const unsigned char *addr = (const unsigned char *)(data + 8);
+        snprintf(out, out_size, "AF_INET6 [%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x]:%u",
+                 addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+                 addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15],
+                 port);
+    } else {
+        snprintf(out, out_size, "family=%u (raw)", family);
+    }
+}
+
 const char *bpf_dump_events(void) {
     unsigned long long key = 0, next_key;
     struct audit_event event;
     char escaped[512];
     char buf[512];
     int first = 1;
-    int map_fd, err;
+    int err;
 
-    if (!g_skel) {
+    if (!g_obj || g_events_fd < 0) {
         return "{\"error\":\"BPF not loaded\"}";
-    }
-
-    map_fd = bpf_map__fd(g_skel->maps.events);
-    if (map_fd < 0) {
-        return "{\"error\":\"Invalid map fd\"}";
     }
 
     g_json_pos = 0;
     json_append("[");
 
     while (1) {
-        err = bpf_map_get_next_key(map_fd, &key, &next_key);
+        err = bpf_map_get_next_key(g_events_fd, &key, &next_key);
         if (err) break;
 
         key = next_key;
-        err = bpf_map_lookup_and_delete_elem(map_fd, &key, &event);
+        err = bpf_map_lookup_and_delete_elem(g_events_fd, &key, &event);
         if (err) continue;
 
         if (!first) json_append(",");
@@ -260,7 +303,7 @@ const char *bpf_dump_events(void) {
         const char *type_str = "UNKNOWN";
         switch (event.event_type) {
             case 1: type_str = "FILE"; break;
-            case 2: type_str = "NETWORK"; break;
+            case 2: type_str = "NET"; break;
             case 3: type_str = "DNS"; break;
         }
 
@@ -278,8 +321,15 @@ const char *bpf_dump_events(void) {
         }
 
         json_append("],\"data\":\"");
-        json_escape_string(event.data, escaped, sizeof(escaped));
-        json_append(escaped);
+        if (event.event_type == 2) {
+            /* NET event: data is raw sockaddr — parse to readable string */
+            _format_sockaddr(event.data, buf, sizeof(buf));
+            json_append(buf);
+        } else {
+            /* FILE/DNS events: data is already a string */
+            json_escape_string(event.data, escaped, sizeof(escaped));
+            json_append(escaped);
+        }
         json_append("\"}");
     }
 
