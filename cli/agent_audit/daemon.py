@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional, Set, Dict, Any
 
 from .config import load_config, save_config
-from .bpf_loader import load_bpf, register_pid, fetch_events, deduplicate_events, unload_bpf
+from .bpf_loader import load_bpf, register_pid, update_agent_tree, fetch_events, deduplicate_events, unload_bpf
 from .log_rotator import make_audit_logger, make_runtime_logger
 
 _PID_FILE = "/root/tmp/agent-audit-daemon.pid"
@@ -48,6 +48,11 @@ def register_agent_pid(pid: int, runtime_logger: Optional[object] = None) -> boo
         if runtime_logger:
             runtime_logger.error(f"Failed to update pid_whitelist for PID {pid}")
         return False
+
+    # Also add to agent_tree so pack_process_chain can find the root
+    if not update_agent_tree(pid, comm):
+        if runtime_logger:
+            runtime_logger.warning(f"Failed to update agent_tree for PID {pid} (chain may be incomplete)")
 
     if runtime_logger:
         runtime_logger.info(f"Agent PID registered: {pid} (comm={comm})")
@@ -245,16 +250,56 @@ def run_loop() -> None:
         }
         return action_map.get(event_type, "unknown")
 
+    # ── /proc 进程信息读取 ─────────────────────────────────────────────
+    def _read_proc_info(pid: int) -> Dict:
+        """从 /proc 读取进程的 cmdline, exe, cwd, ppid."""
+        info = {"cmdline": "", "exe": "", "cwd": "", "ppid": 0}
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                info["cmdline"] = f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        except (FileNotFoundError, PermissionError):
+            pass
+        try:
+            info["exe"] = os.readlink(f"/proc/{pid}/exe")
+        except (OSError, PermissionError):
+            pass
+        try:
+            info["cwd"] = os.readlink(f"/proc/{pid}/cwd")
+        except (OSError, PermissionError):
+            pass
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                fields = f.read().split()
+                info["ppid"] = int(fields[3])
+        except (FileNotFoundError, ValueError, IndexError):
+            pass
+        return info
+
+    # ── Chain 格式化 ──────────────────────────────────────────────────
+    def _format_chain_string(chain_array: list) -> str:
+        """将 BPF chain 数组转换为 spec 字符串格式: 'name(pid)->name(pid)->...'."""
+        if not chain_array:
+            return ""
+        parts = []
+        for node in chain_array:
+            parts.append(f"{node['comm']}({node['pid']})")
+        return "->".join(parts)
+
     # ── Object 字段格式化 ───────────────────────────────────────────────
     def _format_object(event_type: str, data: str) -> tuple:
         """根据事件类型格式化 object 字段，返回 (key, dict)."""
         if event_type == "FILE":
             return "file", {"path": data}
         elif event_type == "NET":
-            if ":" in data and not data.startswith("family"):
-                return "network", {"dst": data, "family": "AF_INET"}
+            # C loader 输出格式: "AF_INET 192.168.5.1:80" 或 "AF_INET6 [...]:port"
+            if data.startswith("AF_INET6"):
+                addr = data[len("AF_INET6 "):]
+                return "network", {"dst": addr, "family": "AF_INET6"}
+            elif data.startswith("AF_INET"):
+                addr = data[len("AF_INET "):]
+                return "network", {"dst": addr, "family": "AF_INET"}
             else:
-                return "network", {"dst": data, "family": data}
+                return "network", {"dst": data, "family": "AF_INET"}
         elif event_type == "DNS":
             return "dns", {"query": data}
         else:
@@ -262,22 +307,21 @@ def run_loop() -> None:
 
     # ── 单事件日志构建 ─────────────────────────────────────────────────
     def _build_single_event_log(event: Dict) -> Dict:
-        """将单个 BPF 事件转换为 JSON-Audit 日志."""
-        # 时间戳转换
+        """将单个 BPF 事件转换为 JSON-Audit 日志（严格遵循 log-format spec）."""
         ts_ns = event.get("ts_ns", 0)
         ts_iso = _convert_bpf_timestamp(ts_ns)
 
-        # 获取PID和进程名
         pid = event.get("pid", 0)
         comm = event.get("comm", "")
 
-        # BPF已打包完整进程链
-        chain = event.get("chain", [])
+        # chain: 数组 → spec 字符串格式
+        chain_str = _format_chain_string(event.get("chain", []))
 
-        # 确定 action
+        # /proc 进程信息
+        proc_info = _read_proc_info(pid)
+
         action = _infer_action_from_type(event.get("type", ""))
 
-        # 组装日志
         log_entry = {
             "ts": ts_iso,
             "type": event.get("type", "UNKNOWN"),
@@ -285,12 +329,14 @@ def run_loop() -> None:
             "process": {
                 "pid": pid,
                 "comm": comm,
-                "chain": chain,
-                "chain_depth": event.get("chain_depth", 0)
+                "cmdline": proc_info["cmdline"],
+                "exe": proc_info["exe"],
+                "cwd": proc_info["cwd"],
+                "ppid": proc_info["ppid"],
+                "chain": chain_str,
             }
         }
 
-        # 动态 object 字段
         object_key, object_value = _format_object(event.get("type"), event.get("data"))
         log_entry[object_key] = object_value
 
