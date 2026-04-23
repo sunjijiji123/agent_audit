@@ -14,6 +14,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <linux/perf_event.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
@@ -40,6 +43,7 @@ struct tree_node {
 
 struct audit_event {
     unsigned int event_type;
+    unsigned int action_type;
     unsigned int pid;
     unsigned long long timestamp_ns;
     char comm[MAX_COMM_LEN];
@@ -107,6 +111,90 @@ static int discover_libc_path(void) {
 }
 
 /* ============================================================
+ * Tracepoint ioctl fallback (for libbpf 1.4 bpf_link_create EACCES)
+ * ============================================================ */
+
+/* Find tracepoint ID from /sys/kernel/debug/tracing/events/ */
+static int find_tracepoint_id(const char *category, const char *name) {
+    char path[512];
+    snprintf(path, sizeof(path),
+             "/sys/kernel/debug/tracing/events/%s/%s/id", category, name);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int id = -1;
+    if (fscanf(f, "%d", &id) != 1) id = -1;
+    fclose(f);
+    return id;
+}
+
+/* Fallback attach: perf_event_open + ioctl(PERF_EVENT_IOC_SET_BPF) */
+static int attach_tracepoint_ioctl(struct bpf_program *prog,
+                                    const char *category, const char *name) {
+    int tp_id = find_tracepoint_id(category, name);
+    if (tp_id < 0) {
+        fprintf(stderr, "[loader] ioctl-fallback: cannot find tracepoint %s/%s\n", category, name);
+        return -1;
+    }
+
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_TRACEPOINT;
+    attr.size = sizeof(attr);
+    attr.config = tp_id;
+    attr.disabled = 1;
+
+    int pfd = syscall(__NR_perf_event_open, &attr, -1, 0, -1, PERF_FLAG_FD_CLOEXEC);
+    if (pfd < 0) {
+        fprintf(stderr, "[loader] ioctl-fallback: perf_event_open failed for %s/%s: %s\n",
+                category, name, strerror(errno));
+        return -1;
+    }
+
+    int prog_fd = bpf_program__fd(prog);
+    if (ioctl(pfd, PERF_EVENT_IOC_SET_BPF, prog_fd) < 0) {
+        fprintf(stderr, "[loader] ioctl-fallback: SET_BPF failed for %s/%s: %s\n",
+                category, name, strerror(errno));
+        close(pfd);
+        return -1;
+    }
+
+    if (ioctl(pfd, PERF_EVENT_IOC_ENABLE, 0) < 0) {
+        fprintf(stderr, "[loader] ioctl-fallback: ENABLE failed for %s/%s: %s\n",
+                category, name, strerror(errno));
+        close(pfd);
+        return -1;
+    }
+
+    fprintf(stderr, "[loader] Attached (ioctl-fallback): %s/%s\n", category, name);
+    return 0;
+}
+
+/* Parse SEC("tracepoint/category/name") to get category and name */
+static int parse_tracepoint_sec(const char *sec, char *category, int cat_size,
+                                 char *name, int name_size) {
+    /* sec format: "tracepoint/category/name" or "tp/category/name" */
+    if (strncmp(sec, "tracepoint/", 11) != 0 &&
+        strncmp(sec, "tp/", 3) != 0)
+        return -1;
+
+    const char *p = strchr(sec, '/');
+    if (!p) return -1;
+    p++; /* skip first '/' */
+
+    const char *slash = strchr(p, '/');
+    if (!slash) return -1;
+
+    int cat_len = slash - p;
+    if (cat_len >= cat_size) cat_len = cat_size - 1;
+    strncpy(category, p, cat_len);
+    category[cat_len] = 0;
+
+    strncpy(name, slash + 1, name_size - 1);
+    name[name_size - 1] = 0;
+    return 0;
+}
+
+/* ============================================================
  * BPF load/attach/unload
  * ============================================================ */
 
@@ -143,14 +231,24 @@ int bpf_load(void) {
         return -1;
     }
 
-    /* Auto-attach all programs */
+    /* Auto-attach all programs with ioctl fallback for tracepoints */
     bpf_object__for_each_program(prog, g_obj) {
+        const char *sec = bpf_program__section_name(prog);
+        const char *pname = bpf_program__name(prog);
+
         link = bpf_program__attach(prog);
         if (!link) {
+            /* Try ioctl fallback for tracepoint programs */
+            char category[128], tname[128];
+            if (sec && parse_tracepoint_sec(sec, category, sizeof(category),
+                                            tname, sizeof(tname)) == 0) {
+                if (attach_tracepoint_ioctl(prog, category, tname) == 0)
+                    continue;
+            }
             fprintf(stderr, "[loader] Warning: failed to attach %s: %s\n",
-                    bpf_program__name(prog), strerror(errno));
+                    pname, strerror(errno));
         } else {
-            fprintf(stderr, "[loader] Attached: %s\n", bpf_program__name(prog));
+            fprintf(stderr, "[loader] Attached: %s\n", pname);
         }
     }
 
@@ -340,10 +438,21 @@ const char *bpf_dump_events(void) {
             case 3: type_str = "DNS"; break;
         }
 
+        const char *action_str = "unknown";
+        switch (event.action_type) {
+            case 0: action_str = "open"; break;
+            case 1: action_str = "read"; break;
+            case 2: action_str = "write"; break;
+            case 3: action_str = "connect"; break;
+            case 4: action_str = "send"; break;
+            case 5: action_str = "recv"; break;
+            case 6: action_str = "resolve"; break;
+        }
+
         json_escape_string(event.comm, escaped, sizeof(escaped));
         snprintf(buf, sizeof(buf),
-            "{\"type\":\"%s\",\"pid\":%u,\"ts_ns\":%llu,\"comm\":\"%s\",\"chain_depth\":%d,\"chain\":[",
-            type_str, event.pid, event.timestamp_ns, escaped, event.chain_depth);
+            "{\"type\":\"%s\",\"action\":\"%s\",\"pid\":%u,\"ts_ns\":%llu,\"comm\":\"%s\",\"chain_depth\":%d,\"chain\":[",
+            type_str, action_str, event.pid, event.timestamp_ns, escaped, event.chain_depth);
         json_append(buf);
 
         for (int i = 0; i < event.chain_depth; i++) {
@@ -354,12 +463,21 @@ const char *bpf_dump_events(void) {
         }
 
         json_append("],\"data\":\"");
-        if (event.event_type == 2) {
-            /* NET event: data is raw sockaddr — parse to readable string */
+        if (event.event_type == 2 && event.action_type == 3) {
+            /* NET connect: data is raw sockaddr — parse to readable string */
             _format_sockaddr(event.data, buf, sizeof(buf));
             json_append(buf);
+        } else if ((event.event_type == 1 && (event.action_type == 1 || event.action_type == 2)) ||
+                   (event.event_type == 2 && (event.action_type == 4 || event.action_type == 5))) {
+            /* read/write/send/recv: data is binary [fd:u32][bytes_lo:u32][bytes_hi:u32] */
+            unsigned int fd = *(unsigned int *)&event.data[0];
+            unsigned int bytes_lo = *(unsigned int *)&event.data[4];
+            unsigned int bytes_hi = *(unsigned int *)&event.data[8];
+            unsigned long long bytes = ((unsigned long long)bytes_hi << 32) | bytes_lo;
+            snprintf(buf, sizeof(buf), "fd=%u bytes=%llu", fd, bytes);
+            json_append(buf);
         } else {
-            /* FILE/DNS events: data is already a string */
+            /* FILE open/DNS: data is already a formatted string */
             json_escape_string(event.data, escaped, sizeof(escaped));
             json_append(escaped);
         }

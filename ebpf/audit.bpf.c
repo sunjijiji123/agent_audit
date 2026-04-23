@@ -2,8 +2,12 @@
 /* eBPF audit program — kernel-level PID whitelist filtering with process chain tracking
  *
  * Monitors:
- *   sys_enter_openat    -> FILE events
- *   sys_enter_connect   -> NET events
+ *   sys_enter_openat    -> FILE open events
+ *   sys_enter_read      -> FILE read events
+ *   sys_enter_write     -> FILE write events
+ *   sys_enter_connect   -> NET connect events
+ *   sys_enter_sendto    -> NET send events
+ *   sys_enter_recvfrom  -> NET recv events
  *   getaddrinfo uprobe  -> DNS events
  *
  * Kernel-space filters by PID whitelist and packs complete process chain.
@@ -16,9 +20,14 @@
 #define MAX_COMM_LEN      16
 #define MAX_DATA_LEN      256
 #define MAX_CHAIN_DEPTH   8
-#define MAX_CHILDREN      16
 
 enum { EVENT_TYPE_FILE = 1, EVENT_TYPE_NETWORK = 2, EVENT_TYPE_DNS = 3 };
+
+enum {
+    ACTION_OPEN = 0, ACTION_READ = 1, ACTION_WRITE = 2,
+    ACTION_CONNECT = 3, ACTION_SEND = 4, ACTION_RECV = 5,
+    ACTION_RESOLVE = 6
+};
 
 struct chain_node {
     __u32 pid;
@@ -36,13 +45,9 @@ struct tree_node {
     __u64 fork_time;
 };
 
-struct children_list {
-    __u32 child_pids[MAX_CHILDREN];
-    __u8  count;
-};
-
 struct audit_event {
     __u32 event_type;
+    __u32 action_type;
     __u32 pid;
     __u64 timestamp_ns;
     char comm[MAX_COMM_LEN];
@@ -73,13 +78,6 @@ struct {
 } agent_tree SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 2048);
-    __type(key, __u32);
-    __type(value, struct children_list);
-} agent_children SEC(".maps");
-
-struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
@@ -87,13 +85,15 @@ struct {
 } event_scratch SEC(".maps");
 
 struct sys_enter_openat_ctx {
-    unsigned char pad[24];   // common fields + __syscall_nr + dfd
-    const char *filename;
+    unsigned char pad[16];   // common(8) + __syscall_nr(4) + pad(4)
+    int dfd;                 // offset 16 (unused but aligns next field)
+    const char *filename;    // offset 24
 };
 
 struct sys_enter_connect_ctx {
-    unsigned char pad[24];   // common fields + __syscall_nr + fd
-    void *addr;
+    unsigned char pad[16];   // common(8) + __syscall_nr(4) + pad(4)
+    int fd;                  // offset 16 (unused but aligns next field)
+    void *addr;              // offset 24
 };
 
 static __always_inline __u16 __bpf_ntohs(__u16 x) {
@@ -142,6 +142,7 @@ int handle_openat(struct sys_enter_openat_ctx *ctx) {
     if (!event) return 0;
 
     event->event_type = EVENT_TYPE_FILE;
+    event->action_type = ACTION_OPEN;
     event->pid = pid;
     event->timestamp_ns = bpf_ktime_get_ns();
     bpf_get_current_comm(event->comm, MAX_COMM_LEN);
@@ -164,6 +165,7 @@ int handle_connect(struct sys_enter_connect_ctx *ctx) {
     if (!event) return 0;
 
     event->event_type   = EVENT_TYPE_NETWORK;
+    event->action_type  = ACTION_CONNECT;
     event->pid          = pid;
     event->timestamp_ns = bpf_ktime_get_ns();
     bpf_get_current_comm(event->comm, MAX_COMM_LEN);
@@ -176,10 +178,10 @@ int handle_connect(struct sys_enter_connect_ctx *ctx) {
 }
 
 /* DNS uprobe — intercepts getaddrinfo() in glibc
- * pt_regs from vmlinux.h, BPF_KPROBE from bpf_tracing.h */
+ * Uses bpf_probe_read_kernel to extract args from pt_regs (uprobe context) */
 
 SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:getaddrinfo")
-int BPF_KPROBE(trace_getaddrinfo, const char *node, const char *service)
+int trace_getaddrinfo(struct pt_regs *ctx)
 {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -191,13 +193,112 @@ int BPF_KPROBE(trace_getaddrinfo, const char *node, const char *service)
     if (!event) return 0;
 
     event->event_type   = EVENT_TYPE_DNS;
+    event->action_type  = ACTION_RESOLVE;
     event->pid          = pid;
     event->timestamp_ns = bpf_ktime_get_ns();
     bpf_get_current_comm(event->comm, MAX_COMM_LEN);
     pack_process_chain(pid, entry, event);
+
+    /* x86_64: first arg (node) in di register, offset 896 bits = 112 bytes */
+    const char *node;
+    bpf_probe_read_kernel(&node, sizeof(node), (void *)ctx + 112);
     bpf_probe_read_user_str(event->data, MAX_DATA_LEN, node);
+
     bpf_map_update_elem(&events, &event->timestamp_ns, event, 0);
     return 0;
+}
+
+/* ── High-frequency syscall handlers (Phase 3) ────────────────────────── */
+
+struct sys_enter_rw_ctx {
+    unsigned char pad[16];   // common(8) + __syscall_nr(4) + pad(4)
+    int fd;                  // offset 16
+    char *buf;               // offset 24
+    size_t count;            // offset 32
+};
+
+struct sys_enter_send_ctx {
+    unsigned char pad[16];   // common(8) + __syscall_nr(4) + pad(4)
+    int fd;                  // offset 16
+    const void *buf;         // offset 24
+    size_t len;              // offset 32
+};
+
+/* data layout for read/write/send/recv events (binary, no string conversion):
+ *   bytes 0-3:  __u32 fd
+ *   bytes 4-7:  __u32 bytes_lo (low 32 bits of count/len)
+ *   bytes 8-11: __u32 bytes_hi (high 32 bits)
+ * Loader.c combines bytes_lo + bytes_hi into u64 for JSON output.
+ * Note: split into u32 writes to avoid unaligned u64 store at data[4]. */
+
+static __always_inline void _store_fd_bytes(struct audit_event *event, int fd, __u64 bytes) {
+    *((__u32 *)&event->data[0]) = (__u32)fd;
+    *((__u32 *)&event->data[4]) = (__u32)(bytes & 0xFFFFFFFF);
+    *((__u32 *)&event->data[8]) = (__u32)(bytes >> 32);
+}
+
+static __always_inline int handle_rw_event(struct sys_enter_rw_ctx *ctx, __u32 action_type) {
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    struct whitelist_entry *entry = bpf_map_lookup_elem(&pid_whitelist, &pid);
+    if (!entry) return 0;
+
+    __u32 zero = 0;
+    struct audit_event *event = bpf_map_lookup_elem(&event_scratch, &zero);
+    if (!event) return 0;
+
+    event->event_type  = EVENT_TYPE_FILE;
+    event->action_type = action_type;
+    event->pid         = pid;
+    event->timestamp_ns = bpf_ktime_get_ns();
+    bpf_get_current_comm(event->comm, MAX_COMM_LEN);
+    pack_process_chain(pid, entry, event);
+    _store_fd_bytes(event, ctx->fd, (__u64)ctx->count);
+
+    bpf_map_update_elem(&events, &event->timestamp_ns, event, 0);
+    return 0;
+}
+
+static __always_inline int handle_send_recv_event(struct sys_enter_send_ctx *ctx, __u32 action_type) {
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    struct whitelist_entry *entry = bpf_map_lookup_elem(&pid_whitelist, &pid);
+    if (!entry) return 0;
+
+    __u32 zero = 0;
+    struct audit_event *event = bpf_map_lookup_elem(&event_scratch, &zero);
+    if (!event) return 0;
+
+    event->event_type  = EVENT_TYPE_NETWORK;
+    event->action_type = action_type;
+    event->pid         = pid;
+    event->timestamp_ns = bpf_ktime_get_ns();
+    bpf_get_current_comm(event->comm, MAX_COMM_LEN);
+    pack_process_chain(pid, entry, event);
+    _store_fd_bytes(event, ctx->fd, (__u64)ctx->len);
+
+    bpf_map_update_elem(&events, &event->timestamp_ns, event, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_read")
+int handle_read(struct sys_enter_rw_ctx *ctx) {
+    return handle_rw_event(ctx, ACTION_READ);
+}
+
+SEC("tracepoint/syscalls/sys_enter_write")
+int handle_write(struct sys_enter_rw_ctx *ctx) {
+    return handle_rw_event(ctx, ACTION_WRITE);
+}
+
+SEC("tracepoint/syscalls/sys_enter_sendto")
+int handle_sendto(struct sys_enter_send_ctx *ctx) {
+    return handle_send_recv_event(ctx, ACTION_SEND);
+}
+
+SEC("tracepoint/syscalls/sys_enter_recvfrom")
+int handle_recvfrom(struct sys_enter_send_ctx *ctx) {
+    return handle_send_recv_event(ctx, ACTION_RECV);
 }
 
 /* Tracepoint handlers for process lifecycle management */
@@ -233,21 +334,13 @@ int handle_sched_process_fork(struct sched_process_fork_ctx *ctx) {
     bpf_get_current_comm(child_node.comm, MAX_COMM_LEN);
     bpf_map_update_elem(&agent_tree, &child_pid, &child_node, 0);
 
-    // Add child to parent's children list
-    struct children_list *children = bpf_map_lookup_elem(&agent_children, &parent_pid);
-    if (children && children->count < MAX_CHILDREN) {
-        children->child_pids[children->count] = child_pid;
-        children->count++;
-        bpf_map_update_elem(&agent_children, &parent_pid, children, 0);
-    }
-
     return 0;
 }
 
 struct sched_process_exec_ctx {
-    __u64 __unused;
-    char comm[16];
-    __u32 pid;
+    __u32 common[2];      // common_type/flags/preempt/pid (8 bytes)
+    __u32 filename_loc;   // offset 8 (data_loc, not used)
+    __u32 pid;            // offset 12
 };
 
 SEC("tracepoint/sched/sched_process_exec")
@@ -259,7 +352,7 @@ int handle_sched_process_exec(struct sched_process_exec_ctx *ctx) {
 
     struct tree_node *node = bpf_map_lookup_elem(&agent_tree, &pid);
     if (node) {
-        bpf_probe_read_kernel(node->comm, MAX_COMM_LEN, ctx->comm);
+        bpf_get_current_comm(node->comm, MAX_COMM_LEN);
         bpf_map_update_elem(&agent_tree, &pid, node, 0);
     }
 
@@ -279,21 +372,9 @@ int handle_sched_process_exit(struct sched_process_exit_ctx *ctx) {
     struct whitelist_entry *entry = bpf_map_lookup_elem(&pid_whitelist, &pid);
     if (!entry) return 0;  // Not in whitelist, skip
 
-    // Recursive cleanup: delete all children first
-    struct children_list *children = bpf_map_lookup_elem(&agent_children, &pid);
-    if (children) {
-        for (int i = 0; i < MAX_CHILDREN && i < children->count; i++) {
-            __u32 child_pid = children->child_pids[i];
-            bpf_map_delete_elem(&pid_whitelist, &child_pid);
-            bpf_map_delete_elem(&agent_tree, &child_pid);
-            bpf_map_delete_elem(&agent_children, &child_pid);
-        }
-    }
-
-    // Delete self
+    // Delete self from maps
     bpf_map_delete_elem(&pid_whitelist, &pid);
     bpf_map_delete_elem(&agent_tree, &pid);
-    bpf_map_delete_elem(&agent_children, &pid);
 
     return 0;
 }
