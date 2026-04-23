@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from agent_audit.config import (
+from cli.agent_audit.config import (
     load_config, save_config, add_target, del_target,
     list_targets, update_log_config,
 )

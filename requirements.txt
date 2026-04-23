@@ -1,0 +1,3 @@
+# Agent Audit - Python Dependencies
+# This is for PyInstaller build only
+# Runtime has no external Python dependencies

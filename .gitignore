@@ -1,36 +1,50 @@
-# Claude Code相关目录
+# Claude Code / 个人配置
 .claude/
 .qoder/
+CLAUDE.md
+AGENTS.md
+BUILDING.md
+
+# OpenSpec 变更管理
 openspec/
 
-# AGENTS文档
-AGENTS.md
+# 测试
+tests/
 
-# Python缓存
+# 运行时配置（由 CLI 创建）
+config.json
+
+# Python 缓存
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 
-# eBPF编译产物（保留源码）
+# 编译产物
 *.o
-
-# C编译产物（保留源码）
+*.so
+*.skel.h
 ebpf/bpf_map_dump
+ebpf/loader.so
+ebpf/audit.bpf.o
 
-# 日志文件
+# 构建产物
+build/
+dist/
+
+# 日志
 *.log
+logs/
 
-# PID文件
+# PID 文件
 *.pid
 
 # 系统文件
 .DS_Store
 Thumbs.db
 
-# IDE配置
+# IDE
 .vscode/
 .idea/
 *.swp
-*.swo
+*.swp
 *~

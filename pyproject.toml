@@ -1,0 +1,17 @@
+[project]
+name = "agent-audit"
+version = "0.1.0"
+description = "AI Agent process audit CLI (eBPF + Python)"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+agent-audit = "cli.cli:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cli*"]
