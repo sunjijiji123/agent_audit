@@ -102,19 +102,32 @@ static __always_inline __u16 __bpf_ntohs(__u16 x) {
 
 static __always_inline void pack_process_chain(__u32 pid, struct whitelist_entry *entry, struct audit_event *event) {
     __u32 current_pid = pid;
-    event->chain_depth = 0;
+    __u32 depth = 0;
+    struct tree_node *node;
 
-    for (int i = 0; i < MAX_CHAIN_DEPTH; i++) {
-        struct tree_node *node = bpf_map_lookup_elem(&agent_tree, &current_pid);
-        if (!node) break;
+    /* Manually unrolled — BPF verifier cannot track loop index bounds */
+#define CHAIN_STEP(idx) \
+    node = bpf_map_lookup_elem(&agent_tree, &current_pid); \
+    if (!node) goto done; \
+    event->chain[idx].pid = current_pid; \
+    bpf_probe_read_kernel(event->chain[idx].comm, MAX_COMM_LEN, node->comm); \
+    depth++; \
+    if (current_pid == entry->root_pid) goto done; \
+    current_pid = node->parent_pid;
 
-        event->chain[i].pid = current_pid;
-        bpf_probe_read_kernel(event->chain[i].comm, MAX_COMM_LEN, node->comm);
-        event->chain_depth++;
+    CHAIN_STEP(0)
+    CHAIN_STEP(1)
+    CHAIN_STEP(2)
+    CHAIN_STEP(3)
+    CHAIN_STEP(4)
+    CHAIN_STEP(5)
+    CHAIN_STEP(6)
+    CHAIN_STEP(7)
 
-        if (current_pid == entry->root_pid) break;
-        current_pid = node->parent_pid;
-    }
+#undef CHAIN_STEP
+
+done:
+    event->chain_depth = (__u8)depth;
 }
 
 SEC("tracepoint/syscalls/sys_enter_openat")
