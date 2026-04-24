@@ -12,11 +12,20 @@ Provides:
 import ctypes
 import json
 import os
+import sys
 from pathlib import Path
 from typing import List, Dict, Set, Optional
 
+
+def _get_project_root() -> Path:
+    """Return project root, handling PyInstaller _MEIPASS."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent.parent.parent
+
+
 # Path to loader shared library
-_LOADER_SO = str(Path(__file__).resolve().parent.parent.parent / "ebpf" / "loader.so")
+_LOADER_SO = str(_get_project_root() / "ebpf" / "loader.so")
 
 
 class _BPFLoaderLib:
@@ -63,6 +72,9 @@ class _BPFLoaderLib:
             cls._lib.bpf_dump_events.restype = ctypes.c_char_p
             cls._lib.bpf_dump_events.argtypes = []
 
+            cls._lib.bpf_set_elf_path.restype = None
+            cls._lib.bpf_set_elf_path.argtypes = [ctypes.c_char_p]
+
             cls._initialized = True
             return True
         except Exception:
@@ -84,14 +96,33 @@ def loader_available() -> bool:
     return _BPFLoaderLib.get() is not None
 
 
-def load_bpf() -> bool:
+def set_elf_path(path: str) -> bool:
+    """Set the BPF ELF object path before loading."""
+    lib = _BPFLoaderLib.get()
+    if not lib:
+        return False
+    try:
+        lib.bpf_set_elf_path(path.encode("utf-8"))
+        return True
+    except Exception:
+        return False
+
+
+def load_bpf(elf_path: Optional[str] = None) -> bool:
     """Load BPF program via libbpf skeleton.
+
+    Args:
+        elf_path: Optional path to BPF ELF object. If provided, calls
+                  set_elf_path() before loading.
 
     Returns True on success.
     """
     lib = _BPFLoaderLib.get()
     if not lib:
         return False
+
+    if elf_path:
+        set_elf_path(elf_path)
 
     try:
         return lib.bpf_load() == 0

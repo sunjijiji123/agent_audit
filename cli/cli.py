@@ -13,8 +13,8 @@ from cli.agent_audit.config import (
     list_targets, update_log_config,
 )
 
-_root = Path(__file__).resolve().parent.parent
-_config_path = str(_root / "config.json")
+from cli.agent_audit.config import _get_config_path
+_config_path = str(_get_config_path())
 
 
 # ── daemon ────────────────────────────────────────────────────────────────────
@@ -23,37 +23,13 @@ def daemon_cmd(args) -> None:
     action = args.action
 
     if action == "start":
-        pid = os.fork()
-        if pid == 0:
-            os.close(0)
-            os.close(1)
-            os.close(2)
-            os.open(os.devnull, os.O_RDWR)
-            os.dup2(0, 1)
-            os.dup2(0, 2)
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(_root)
-            os.chdir("/")
-            os.execvpe(
-                sys.executable,
-                [sys.executable, "-m", "cli.agent_audit", "start"],
-                env,
-            )
-        else:
-            time.sleep(0.6)
-            try:
-                with open("/root/tmp/agent-audit-daemon.pid") as f:
-                    daemon_pid = int(f.read().strip())
-                if os.path.exists(f"/proc/{daemon_pid}"):
-                    print(f"Daemon started (PID {daemon_pid})")
-                else:
-                    print("Daemon process exited — check logs")
-            except Exception:
-                print("Could not verify daemon status")
+        from cli.agent_audit.daemon import DaemonRunner
+        runner = DaemonRunner()
+        runner.start()
 
     elif action == "stop":
         try:
-            with open("/root/tmp/agent-audit-daemon.pid") as f:
+            with open("/tmp/agent-audit-daemon.pid") as f:
                 pid = int(f.read().strip())
         except Exception:
             print("Daemon not running (no PID file)")
@@ -62,7 +38,7 @@ def daemon_cmd(args) -> None:
         if not os.path.exists(f"/proc/{pid}"):
             print("Daemon not running")
             try:
-                os.unlink("/root/tmp/agent-audit-daemon.pid")
+                os.unlink("/tmp/agent-audit-daemon.pid")
             except FileNotFoundError:
                 pass
             return
@@ -73,14 +49,14 @@ def daemon_cmd(args) -> None:
                 break
             time.sleep(0.1)
         try:
-            os.unlink("/root/tmp/agent-audit-daemon.pid")
+            os.unlink("/tmp/agent-audit-daemon.pid")
         except FileNotFoundError:
             pass
         print("Daemon stopped")
 
     elif action == "status":
         try:
-            with open("/root/tmp/agent-audit-daemon.pid") as f:
+            with open("/tmp/agent-audit-daemon.pid") as f:
                 pid = int(f.read().strip())
             if os.path.exists(f"/proc/{pid}"):
                 print(f"Running (PID {pid})")

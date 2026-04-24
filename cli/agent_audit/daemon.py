@@ -8,17 +8,70 @@ import json
 from pathlib import Path
 from typing import Optional, Set, Dict, Any
 
-from .config import load_config, save_config
-from .bpf_loader import load_bpf, register_pid, update_agent_tree, fetch_events, deduplicate_events, unload_bpf
+from .config import load_config, save_config, _get_config_path
+from .bpf_loader import load_bpf, register_pid, update_agent_tree, fetch_events, deduplicate_events, unload_bpf, set_elf_path
 from .log_rotator import make_audit_logger, make_runtime_logger
 
-_PID_FILE = "/root/tmp/agent-audit-daemon.pid"
-_CONFIG_PATH = str(Path(__file__).resolve().parent.parent.parent / "config.json")
+
+def _get_resource_root() -> Path:
+    """Return project root, handling PyInstaller _MEIPASS."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent.parent.parent
+
+
+_PID_FILE = "/tmp/agent-audit-daemon.pid"
 _PIN_DIR = "/sys/fs/bpf/audit"
+
+
+_CONFIG_PATH = str(_get_config_path())
 
 _run_loop_flag = True
 _logger: Optional[object] = None
 _runtime_logger: Optional[object] = None
+
+
+# ── Target scanning ───────────────────────────────────────────────────────────
+
+def _scan_targets(cfg: dict, runtime_logger: Optional[object] = None) -> int:
+    """Scan /proc for processes matching target comm names, register into whitelist.
+
+    Returns number of newly registered PIDs.
+    """
+    targets = cfg.get("targets", [])
+    if not targets:
+        return 0
+
+    # Build set of target comm names
+    target_names = set()
+    for t in targets:
+        if t.get("enabled", True):
+            comm = t.get("process", "")
+            if comm:
+                target_names.add(comm)
+
+    if not target_names:
+        return 0
+
+    registered = 0
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f"/proc/{pid}/comm", "r") as f:
+                    comm = f.read().strip()
+            except (OSError, FileNotFoundError):
+                continue
+
+            if comm in target_names:
+                if register_agent_pid(pid, runtime_logger):
+                    registered += 1
+    except Exception:
+        pass
+
+    return registered
 
 
 # ── PID whitelist management ───────────────────────────────────────────────────────
@@ -167,11 +220,6 @@ def run_loop() -> None:
     max_size_mb = log_cfg.get("max_size_mb", 50)
     backup_count = log_cfg.get("backup_count", 5)
     poll_interval = cfg.get("daemon", {}).get("poll_interval_sec", 2)
-    bpf_elf = cfg.get("daemon", {}).get("bpf_elf", "")
-
-    if not bpf_elf or not os.path.exists(bpf_elf):
-        print(f"BPF ELF not found: {bpf_elf}", file=sys.stderr)
-        return
 
     # Initialize dual logger system
     _logger = make_audit_logger(log_path, max_size_mb, backup_count)
@@ -182,9 +230,30 @@ def run_loop() -> None:
     inotify_fd = _setup_inotify(_CONFIG_PATH)
     last_inotify_check = 0.0
 
+    # ── Resolve BPF ELF path ────────────────────────────────────────
+    resource_root = _get_resource_root()
+    bpf_elf = cfg.get("daemon", {}).get("bpf_elf", "")
+
+    # If relative path, resolve against resource root (daemon forks and chdirs "/")
+    if bpf_elf and not os.path.isabs(bpf_elf):
+        resolved = str(resource_root / bpf_elf)
+        if os.path.exists(resolved):
+            bpf_elf = resolved
+
+    embedded_elf = str(resource_root / "ebpf" / "audit.bpf.o")
+    if bpf_elf and os.path.exists(bpf_elf):
+        pass  # user-defined path valid
+    elif os.path.exists(embedded_elf):
+        bpf_elf = embedded_elf
+    else:
+        print(f"BPF ELF not found: {bpf_elf or embedded_elf}", file=sys.stderr)
+        return
+
+    set_elf_path(bpf_elf)
+
     # ── Load BPF program ──────────────────────────────────────────────
     if load_bpf():
-        _runtime_logger.info("BPF loaded via libbpf")
+        _runtime_logger.info(f"BPF loaded via libbpf: {bpf_elf}")
     else:
         _runtime_logger.error("BPF load failed")
         _logger.close()
@@ -198,6 +267,13 @@ def run_loop() -> None:
             _runtime_logger.error(f"Failed to register Agent PID {pid}")
 
     _runtime_logger.info(f"Daemon started, agent_pids: {agent_pids}")
+
+    # Initial scan for matching targets
+    scan_interval = 5.0
+    last_scan_time = 0.0
+    n = _scan_targets(cfg, _runtime_logger)
+    if n:
+        _runtime_logger.info(f"Target scan registered {n} PIDs")
 
     seen_events: Set[int] = set()
 
@@ -382,6 +458,13 @@ def run_loop() -> None:
     while _run_loop_flag:
         now = time.time()
 
+        # Periodic target scan
+        if (now - last_scan_time) > scan_interval:
+            last_scan_time = now
+            n = _scan_targets(cfg, _runtime_logger)
+            if n:
+                _runtime_logger.info(f"Target scan registered {n} new PIDs")
+
         # inotify config reload
         if inotify_fd is not None and (now - last_inotify_check) > 0.5:
             last_inotify_check = now
@@ -394,6 +477,9 @@ def run_loop() -> None:
                     cfg.clear()
                     cfg.update(new_cfg)
                     _runtime_logger.info("Config reloaded")
+                    n = _scan_targets(cfg, _runtime_logger)
+                    if n:
+                        _runtime_logger.info(f"Config reload scan registered {n} new PIDs")
             except Exception:
                 pass
 
@@ -406,6 +492,13 @@ def run_loop() -> None:
         # Process each event individually and write to JSONL log
         for event in events:
             log_entry = _build_single_event_log(event)
+
+            # Filter out noisy read/write events with meaningless paths
+            if event.get("type") == "FILE" and event.get("action") in ("read", "write"):
+                path = log_entry.get("file", {}).get("path", "")
+                if not path or path.startswith("/dev/pts/") or path.startswith("socket:") or path.startswith("pipe:"):
+                    continue
+
             _logger.log_event(log_entry)
 
         time.sleep(poll_interval)

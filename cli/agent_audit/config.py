@@ -3,13 +3,28 @@
 import json
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
 # Path to config.json — relative to this file's parent project root
 _CONFIG_NAME = "config.json"
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / _CONFIG_NAME
+
+
+def _get_config_path() -> Path:
+    """Find config.json: env > program root > project root."""
+    env_path = os.environ.get("AGENT_AUDIT_CONFIG")
+    if env_path:
+        return Path(env_path)
+    # PyInstaller onedir: config.json sits next to the executable
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS).parent / _CONFIG_NAME
+    # Dev mode: project root
+    return Path(__file__).resolve().parent.parent / _CONFIG_NAME
+
+
+_CONFIG_PATH = _get_config_path()
 
 DEFAULT_CONFIG = {
     "log": {
@@ -19,7 +34,7 @@ DEFAULT_CONFIG = {
     },
     "daemon": {
         "poll_interval_sec": 2,
-        "bpf_elf": "/root/ai-ebpf-demo-cli/ebpf/audit.bpf.o",
+        "bpf_elf": "ebpf/audit.bpf.o",
         "bpf_map_id": None,
     },
     "targets": [],
