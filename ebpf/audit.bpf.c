@@ -223,8 +223,8 @@ int trace_getaddrinfo(struct pt_regs *ctx)
 /* ── High-frequency syscall handlers (Phase 3) ────────────────────────── */
 
 struct sys_enter_rw_ctx {
-    unsigned char pad[16];   // common fields(8) + __syscall_nr(4) + pad(4)
-    unsigned int fd;         // offset 16
+    unsigned char pad[16];   // common(8) + __syscall_nr(4) + pad(4)
+    int fd;                  // offset 16
     char *buf;               // offset 24
     size_t count;            // offset 32
 };
@@ -304,9 +304,9 @@ int handle_sched_process_fork(struct sched_process_fork_ctx *ctx) {
 }
 
 struct sched_process_exec_ctx {
-    __u64 __unused;
-    char comm[16];
-    __u32 pid;
+    __u32 common[2];      // common_type/flags/preempt/pid (8 bytes)
+    __u32 filename_loc;   // offset 8 (data_loc, not used)
+    __u32 pid;            // offset 12
 };
 
 SEC("tracepoint/sched/sched_process_exec")
@@ -318,7 +318,7 @@ int handle_sched_process_exec(struct sched_process_exec_ctx *ctx) {
 
     struct tree_node *node = bpf_map_lookup_elem(&agent_tree, &pid);
     if (node) {
-        bpf_probe_read_kernel(node->comm, MAX_COMM_LEN, ctx->comm);
+        bpf_get_current_comm(node->comm, MAX_COMM_LEN);
         bpf_map_update_elem(&agent_tree, &pid, node, 0);
     }
 
