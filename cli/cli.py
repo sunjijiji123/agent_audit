@@ -71,16 +71,28 @@ def daemon_cmd(args) -> None:
 # ── audit ─────────────────────────────────────────────────────────────────────
 
 def audit_add(args) -> None:
-    cfg = add_target(
-        process=args.process,
-        file=args.file or [],
-        network=args.network or [],
-        dns=args.dns or [],
-        path=_config_path,
-    )
+    if args.processpath and not args.processpath.strip():
+        print("Error: --processpath cannot be empty")
+        sys.exit(1)
+    try:
+        cfg = add_target(
+            process=args.process,
+            file=args.file or [],
+            network=args.network or [],
+            dns=args.dns or [],
+            processpath=args.processpath,
+            path=_config_path,
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     targets = cfg.get("targets", [])
     t = targets[-1]
-    print(f"Added: [{t['id']}] {t['process']}"
+    if t.get("process"):
+        identifier = f"process={t['process']}"
+    else:
+        identifier = f"path={t['processpath']}"
+    print(f"Added: [{t['id']}] {identifier}"
           f"  file={bool(t.get('file'))}"
           f"  net={bool(t.get('network'))}"
           f"  dns={bool(t.get('dns'))}")
@@ -104,7 +116,8 @@ def audit_del(args) -> None:
 
     cfg["targets"] = [t for t in targets if t.get("id") != match["id"]]
     save_config(cfg, _config_path)
-    print(f"Deleted: [{match['id']}] {match['process']}")
+    label = match.get("process") or match.get("processpath", "")
+    print(f"Deleted: [{match['id']}] {label}")
 
 
 def audit_list(args) -> None:
@@ -116,7 +129,11 @@ def audit_list(args) -> None:
         print(json.dumps(targets, indent=2))
     else:
         for t in targets:
-            print(f"  [{t['id']}] {t['process']}"
+            if t.get("process"):
+                identifier = f"process={t['process']}"
+            else:
+                identifier = f"path={t['processpath']}"
+            print(f"  [{t['id']}] {identifier}"
                   f"  file={bool(t.get('file'))}"
                   f"  net={bool(t.get('network'))}"
                   f"  dns={bool(t.get('dns'))}"
@@ -210,7 +227,9 @@ def main() -> None:
     p_audit_sub = p_audit.add_subparsers(dest="audit_action", required=True)
 
     p_audit_add = p_audit_sub.add_parser("add", help="Add audit target")
-    p_audit_add.add_argument("--process", required=True)
+    add_group = p_audit_add.add_mutually_exclusive_group(required=True)
+    add_group.add_argument("--process", help="Match by process comm name")
+    add_group.add_argument("--processpath", help="Match by executable path (glob)")
     p_audit_add.add_argument("--file", action="append", default=[])
     p_audit_add.add_argument("--network", action="append", default=[])
     p_audit_add.add_argument("--dns", action="append", default=[])

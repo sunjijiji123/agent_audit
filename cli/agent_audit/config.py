@@ -73,18 +73,29 @@ def next_target_id(cfg: dict) -> int:
 
 
 def add_target(
-    process: str,
+    process: Optional[str] = None,
     file: Optional[list] = None,
     network: Optional[list] = None,
     dns: Optional[list] = None,
+    processpath: Optional[str] = None,
     path: Optional[str] = None,
 ) -> dict:
-    """Add a new audit target. Returns the updated config."""
+    """Add a new audit target. Returns the updated config.
+
+    Either ``process`` (comm) or ``processpath`` (exe glob) must be provided,
+    but not both.
+    """
+    if not process and not processpath:
+        raise ValueError("Either --process or --processpath must be provided")
+    if process and processpath:
+        raise ValueError("Cannot specify both --process and --processpath")
+
     cfg = load_config(path)
     new_id = next_target_id(cfg)
     target = {
         "id": new_id,
-        "process": process,
+        "process": process or "",
+        "processpath": processpath or "",
         "file": file or [],
         "network": network or [],
         "dns": dns or [],

@@ -1,10 +1,12 @@
 """Daemon runner — loads BPF, polls map, writes JSONL with BPF-packed process chain."""
 
+import fnmatch
 import os
 import sys
 import time
 import signal
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional, Set, Dict, Any
 
@@ -34,23 +36,28 @@ _runtime_logger: Optional[object] = None
 # ── Target scanning ───────────────────────────────────────────────────────────
 
 def _scan_targets(cfg: dict, runtime_logger: Optional[object] = None) -> int:
-    """Scan /proc for processes matching target comm names, register into whitelist.
+    """Scan /proc for processes matching targets, register into whitelist.
 
-    Returns number of newly registered PIDs.
+    Targets are matched by either ``process`` (comm name) or ``processpath``
+    (executable path glob), whichever is configured. Returns number of newly
+    registered PIDs.
     """
     targets = cfg.get("targets", [])
     if not targets:
         return 0
 
-    # Build set of target comm names
-    target_names = set()
+    # Separate targets by match type
+    comm_targets = []
+    path_targets = []
     for t in targets:
-        if t.get("enabled", True):
-            comm = t.get("process", "")
-            if comm:
-                target_names.add(comm)
+        if not t.get("enabled", True):
+            continue
+        if t.get("process"):
+            comm_targets.append(t)
+        elif t.get("processpath"):
+            path_targets.append(t)
 
-    if not target_names:
+    if not comm_targets and not path_targets:
         return 0
 
     registered = 0
@@ -59,13 +66,36 @@ def _scan_targets(cfg: dict, runtime_logger: Optional[object] = None) -> int:
             if not entry.isdigit():
                 continue
             pid = int(entry)
-            try:
-                with open(f"/proc/{pid}/comm", "r") as f:
-                    comm = f.read().strip()
-            except (OSError, FileNotFoundError):
-                continue
+            matched = False
 
-            if comm in target_names:
+            # Try comm-based matching
+            if comm_targets:
+                try:
+                    with open(f"/proc/{pid}/comm", "r") as f:
+                        comm = f.read().strip()
+                except (OSError, FileNotFoundError):
+                    comm = None
+
+                if comm:
+                    for target in comm_targets:
+                        if comm == target["process"]:
+                            matched = True
+                            break
+
+            # Try path-based matching (only if not already matched)
+            if not matched and path_targets:
+                try:
+                    exe = os.readlink(f"/proc/{pid}/exe")
+                except (OSError, FileNotFoundError):
+                    exe = None
+
+                if exe:
+                    for target in path_targets:
+                        if fnmatch.fnmatch(exe, target["processpath"]):
+                            matched = True
+                            break
+
+            if matched:
                 if register_agent_pid(pid, runtime_logger):
                     registered += 1
     except Exception:
