@@ -14,7 +14,16 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import List, Dict, Set, Optional
+from typing import List, Dict, Set, Optional, TypedDict
+
+
+class TreeNode(ctypes.Structure):
+    """Mirrors struct tree_node from loader.c."""
+    _fields_ = [
+        ("parent_pid", ctypes.c_uint),
+        ("comm", ctypes.c_char * 16),
+        ("fork_time", ctypes.c_ulonglong),
+    ]
 
 
 def _get_project_root() -> Path:
@@ -74,6 +83,12 @@ class _BPFLoaderLib:
 
             cls._lib.bpf_set_elf_path.restype = None
             cls._lib.bpf_set_elf_path.argtypes = [ctypes.c_char_p]
+
+            cls._lib.bpf_map_lookup_agent_tree.restype = ctypes.c_int
+            cls._lib.bpf_map_lookup_agent_tree.argtypes = [
+                ctypes.c_uint,
+                ctypes.POINTER(TreeNode),
+            ]
 
             cls._initialized = True
             return True
@@ -205,6 +220,29 @@ def update_agent_tree(pid: int, comm: str) -> bool:
         ) == 0
     except Exception:
         return False
+
+
+def lookup_agent_tree(pid: int) -> Optional[Dict]:
+    """Look up a PID in the agent_tree BPF map.
+
+    Returns dict with parent_pid, comm, fork_time; or None if not found.
+    """
+    lib = _BPFLoaderLib.get()
+    if not lib:
+        return None
+
+    node = TreeNode()
+    try:
+        if lib.bpf_map_lookup_agent_tree(ctypes.c_uint(pid), ctypes.byref(node)) != 0:
+            return None
+    except Exception:
+        return None
+
+    return {
+        "parent_pid": node.parent_pid,
+        "comm": node.comm.decode("utf-8", errors="replace").rstrip("\x00"),
+        "fork_time": node.fork_time,
+    }
 
 
 def fetch_events() -> List[Dict]:

@@ -10,12 +10,13 @@ import json
 import uuid
 import functools
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Set, Dict, Any
 
 from .config import load_config, save_config, _get_config_path
-from .bpf_loader import load_bpf, register_pid, update_agent_tree, fetch_events, deduplicate_events, unload_bpf, set_elf_path
+from .bpf_loader import load_bpf, register_pid, update_agent_tree, fetch_events, deduplicate_events, unload_bpf, set_elf_path, lookup_agent_tree
 from .log_rotator import make_audit_logger, make_runtime_logger
 
 # DAS-DS constants
@@ -27,6 +28,18 @@ _EVENT_TYPE_MAP = {
     "DNS": ("dnsQuery", 130003),
     "FORK": ("processCreate", 110001),
 }
+
+PROC_CACHE_TTL = 30
+
+
+@dataclass
+class ProcInfo:
+    cmdline: str = ""
+    exe: str = ""
+    cwd: str = ""
+    ppid: int = 0
+    username: str = ""
+    cached_at: float = 0.0
 
 
 def _get_resource_root() -> Path:
@@ -389,40 +402,67 @@ def run_loop() -> None:
         }
         return action_map.get(event_type, "unknown")
 
-    # ── /proc 进程信息读取 ─────────────────────────────────────────────
-    def _read_proc_info(pid: int) -> Dict:
-        """从 /proc 读取进程的 cmdline, exe, cwd, ppid, uid, username."""
-        info = {"cmdline": "", "exe": "", "cwd": "", "ppid": 0, "username": ""}
+    # ── /proc 进程信息读取（带缓存） ─────────────────────────────────────
+    _proc_cache: Dict[int, ProcInfo] = {}
+
+    def _get_proc_info(pid: int) -> Dict:
+        """从缓存获取进程信息，未命中或过期则读 /proc 并更新缓存。"""
+        now = time.time()
+        cached = _proc_cache.get(pid)
+        if cached and (now - cached.cached_at) < PROC_CACHE_TTL:
+            return {"cmdline": cached.cmdline, "exe": cached.exe,
+                    "cwd": cached.cwd, "ppid": cached.ppid,
+                    "username": cached.username}
+
+        # ppid: prefer agent_tree, fallback to /proc/stat
+        ppid = 0
+        tree_entry = lookup_agent_tree(pid)
+        if tree_entry:
+            ppid = tree_entry["parent_pid"]
+
+        info = ProcInfo(cached_at=now)
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as f:
-                info["cmdline"] = f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
-        except (FileNotFoundError, PermissionError):
+                info.cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        except FileNotFoundError:
+            _proc_cache.pop(pid, None)
+            return {"cmdline": "", "exe": "", "cwd": "", "ppid": 0, "username": ""}
+        except PermissionError:
             pass
         try:
-            info["exe"] = os.readlink(f"/proc/{pid}/exe")
+            info.exe = os.readlink(f"/proc/{pid}/exe")
         except (OSError, PermissionError):
             pass
         try:
-            info["cwd"] = os.readlink(f"/proc/{pid}/cwd")
+            info.cwd = os.readlink(f"/proc/{pid}/cwd")
         except (OSError, PermissionError):
             pass
-        try:
-            with open(f"/proc/{pid}/stat") as f:
-                fields = f.read().split()
-                info["ppid"] = int(fields[3])
-        except (FileNotFoundError, ValueError, IndexError):
-            pass
+
+        # ppid fallback to /proc/stat if agent_tree lookup failed
+        if ppid == 0:
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    fields = f.read().split()
+                    ppid = int(fields[3])
+            except (FileNotFoundError, ValueError, IndexError):
+                pass
+        info.ppid = ppid
+
         try:
             with open(f"/proc/{pid}/status") as f:
                 for line in f:
                     if line.startswith("Uid:"):
                         uid = int(line.split()[1])
                         import pwd
-                        info["username"] = pwd.getpwuid(uid).pw_name
+                        info.username = pwd.getpwuid(uid).pw_name
                         break
         except (FileNotFoundError, ValueError, IndexError, OSError, KeyError):
             pass
-        return info
+
+        _proc_cache[pid] = info
+        return {"cmdline": info.cmdline, "exe": info.exe,
+                "cwd": info.cwd, "ppid": info.ppid,
+                "username": info.username}
 
     # ── Chain 格式化 ──────────────────────────────────────────────────
     def _format_chain_string(chain_array: list) -> str:
@@ -482,8 +522,8 @@ def run_loop() -> None:
         else:
             op_type = action
 
-        # Process info from /proc
-        proc_info = _read_proc_info(pid)
+        # Process info from /proc (cached)
+        proc_info = _get_proc_info(pid)
 
         # processGuid (deterministic per PID)
         process_guid = _generate_process_guid(pid, ts_ns)

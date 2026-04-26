@@ -251,6 +251,13 @@ int bpf_map_update_agent_tree(unsigned int pid, const char *comm) {
     return 0;
 }
 
+int bpf_map_lookup_agent_tree(unsigned int pid, struct tree_node *out) {
+    if (!g_obj || g_agent_tree_fd < 0) {
+        return -1;
+    }
+    return bpf_map_lookup_elem(g_agent_tree_fd, &pid, out);
+}
+
 /* ============================================================
  * Events dump
  * ============================================================ */
