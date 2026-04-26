@@ -18,6 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     binutils \
     libc6-dev \
     upx-ucl \
+    cmake \
+    make \
+    clang \
+    llvm \
+    libelf-dev \
+    zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装 Python 依赖

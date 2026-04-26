@@ -13,15 +13,12 @@ echo "Python: $(python --version)"
 echo "PyInstaller: $(pyinstaller --version)"
 echo ""
 
-# 检查 loader.so 是否存在
-if [ ! -f "ebpf/loader.so" ]; then
-    echo "⚠️  ebpf/loader.so 不存在，尝试编译..."
-    if [ -f "ebpf/loader.c" ]; then
-        echo "编译 libbpf loader..."
-        # 这里需要 libbpf 开发环境，实际构建时要先编译
-        echo "注意：loader.so 需要提前编译好，放到 ebpf/ 目录下"
-    fi
-fi
+# 编译 eBPF loader (libbpf 1.4.0 源码自动下载)
+echo "🔨 编译 eBPF loader (libbpf 1.4.0)..."
+cd ebpf && cmake -S . -B build && make -C build
+cp build/audit.bpf.o build/loader.so .
+cd ..
+echo "✅ eBPF loader 编译完成"
 
 # 安装 Python 依赖
 echo "📦 安装 Python 依赖..."
