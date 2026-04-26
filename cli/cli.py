@@ -150,26 +150,27 @@ def log_cmd(args) -> None:
         print(f"Log file not found: {log_path}")
         sys.exit(1)
 
+    with open(log_path, encoding="utf-8") as f:
+        lines = f.readlines()
+
+    # Read range: --tail N, --cat (all), or default last 20
     if args.tail:
-        with open(log_path, encoding="utf-8") as f:
-            lines = f.readlines()
         lines = lines[-args.tail:]
-    elif args.grep:
-        with open(log_path, encoding="utf-8") as f:
-            lines = [line for line in f if args.grep in line]
-    elif args.type_filter:
-        type_map = {"FILE": '"type":"FILE"', "NET": '"type":"NET"', "DNS": '"type":"DNS"'}
-        marker = type_map.get(args.type_filter, '')
-        with open(log_path, encoding="utf-8") as f:
-            lines = [line for line in f if marker in line]
-    elif args.cat:
-        with open(log_path, encoding="utf-8") as f:
-            print(f.read(), end="")
-        return
-    else:
-        with open(log_path, encoding="utf-8") as f:
-            lines = f.readlines()
+    elif not args.cat:
         lines = lines[-20:]
+
+    # Content filters (composable)
+    if args.grep:
+        lines = [line for line in lines if args.grep in line]
+    if args.type_filter:
+        type_map = {
+            "FILE": '"eventType":"fileEvent"',
+            "NET": '"eventType":"networkConnect"',
+            "DNS": '"eventType":"dnsQuery"',
+            "FORK": '"eventType":"processCreate"',
+        }
+        marker = type_map[args.type_filter]
+        lines = [line for line in lines if marker in line]
 
     for line in lines:
         print(line, end="")
@@ -236,8 +237,9 @@ def main() -> None:
     p_audit_add.set_defaults(fn=audit_add)
 
     p_audit_del = p_audit_sub.add_parser("del", help="Delete audit target")
-    p_audit_del.add_argument("--process", default=None)
-    p_audit_del.add_argument("--id", type=int, default=None)
+    del_group = p_audit_del.add_mutually_exclusive_group(required=True)
+    del_group.add_argument("--process", help="Delete by process comm name")
+    del_group.add_argument("--id", type=int, help="Delete by target ID")
     p_audit_del.set_defaults(fn=audit_del)
 
     p_audit_list = p_audit_sub.add_parser("list", help="List audit targets")
@@ -246,10 +248,11 @@ def main() -> None:
 
     # log
     p_log = sub.add_parser("log", help="Read audit log")
-    p_log.add_argument("--tail", type=int, metavar="N")
+    range_group = p_log.add_mutually_exclusive_group()
+    range_group.add_argument("--tail", type=int, metavar="N")
+    range_group.add_argument("--cat", action="store_true")
     p_log.add_argument("--grep", metavar="STR")
-    p_log.add_argument("--type", dest="type_filter", choices=["FILE", "NET", "DNS"])
-    p_log.add_argument("--cat", action="store_true")
+    p_log.add_argument("--type", dest="type_filter", choices=["FILE", "NET", "DNS", "FORK"])
     p_log.set_defaults(fn=log_cmd)
 
     # config
@@ -263,10 +266,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.cmd == "audit":
-        args.fn(args)
-    else:
-        args.fn(args)
+    args.fn(args)
 
 
 if __name__ == "__main__":

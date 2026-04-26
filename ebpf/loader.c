@@ -340,6 +340,7 @@ const char *bpf_dump_events(void) {
             case 1: type_str = "FILE"; break;
             case 2: type_str = "NET"; break;
             case 3: type_str = "DNS"; break;
+            case 4: type_str = "FORK"; break;
         }
 
         const char *action_str = "unknown";
@@ -351,6 +352,7 @@ const char *bpf_dump_events(void) {
             case 4: action_str = "send"; break;
             case 5: action_str = "recv"; break;
             case 6: action_str = "resolve"; break;
+            case 5: action_str = "fork"; break;
         }
 
         json_escape_string(event.comm, escaped, sizeof(escaped));

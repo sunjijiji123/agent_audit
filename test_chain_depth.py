@@ -93,27 +93,22 @@ def main():
     # Show all unique chains
     seen_chains = set()
     for e in events:
-        chain = e.get("chain", [])
-        chain_key = tuple((n["pid"], n["comm"]) for n in chain)
-        if chain_key not in seen_chains:
-            seen_chains.add(chain_key)
-            depth = e.get("chain_depth", 0)
-            chain_str = " → ".join(f"{n['comm']}({n['pid']})" for n in chain)
-            log(f"  type={e.get('type'):<5} depth={depth} chain={chain_str}")
+        chain_str = e.get("processChain", "")
+        if chain_str and chain_str not in seen_chains:
+            seen_chains.add(chain_str)
+            log(f"  type={e.get('eventType'):<15} chain={chain_str}")
 
-    # Look specifically for ls events (should have depth >= 2)
-    ls_events = [e for e in events if e.get("process", {}).get("comm") == "ls"]
-    bash_events = [e for e in events if e.get("process", {}).get("comm") == "bash"]
+    # Look specifically for ls events (should have chain containing ls)
+    ls_events = [e for e in events if e.get("processName") == "ls"]
+    bash_events = [e for e in events if e.get("processName") == "bash"]
 
     log(f"\nls events: {len(ls_events)}")
     log(f"bash events: {len(bash_events)}")
 
     if ls_events:
         e = ls_events[0]
-        chain = e.get("chain", [])
-        log(f"ls chain depth: {e.get('chain_depth')}")
-        for i, node in enumerate(chain):
-            log(f"  [{i}] pid={node['pid']} comm={node['comm']}")
+        chain_str = e.get("processChain", "")
+        log(f"ls processChain: {chain_str}")
     else:
         log("No ls events — checking if child was auto-whitelisted...")
 

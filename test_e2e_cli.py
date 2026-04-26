@@ -174,9 +174,9 @@ def main():
         return 1
 
     # ── Step 7: Verify each event type ──
-    file_events = [e for e in events if e.get("type") == "FILE"]
-    net_events = [e for e in events if e.get("type") == "NET"]
-    dns_events = [e for e in events if e.get("type") == "DNS"]
+    file_events = [e for e in events if e.get("eventType") == "fileEvent"]
+    net_events = [e for e in events if e.get("eventType") == "networkConnect"]
+    dns_events = [e for e in events if e.get("eventType") == "dnsQuery"]
 
     log(f"  FILE events: {len(file_events)}")
     log(f"  NET  events: {len(net_events)}")
@@ -187,8 +187,8 @@ def main():
     # Check FILE events
     if file_events:
         e = file_events[0]
-        log(f"  ✓ FILE: data='{e.get('file', {}).get('path', '')}'")
-        if not e.get("file", {}).get("path"):
+        log(f"  ✓ FILE: filePath='{e.get('filePath', '')}'")
+        if not e.get("filePath"):
             log("  ✗ FILE data is empty!")
             all_ok = False
     else:
@@ -198,9 +198,9 @@ def main():
     # Check NET events — this is the key test
     if net_events:
         e = net_events[0]
-        net_obj = e.get("network", {})
-        log(f"  ✓ NET: dst='{net_obj.get('dst', '')}' family='{net_obj.get('family', '')}'")
-        if not net_obj.get("dst"):
+        dst = e.get("networkDst", "")
+        log(f"  ✓ NET: dst='{dst}'")
+        if not dst:
             log("  ✗ NET data is empty!")
             all_ok = False
         else:
@@ -212,8 +212,8 @@ def main():
     # Check DNS events
     if dns_events:
         e = dns_events[0]
-        log(f"  ✓ DNS: query='{e.get('dns', {}).get('query', '')}'")
-        if not e.get("dns", {}).get("query"):
+        log(f"  ✓ DNS: query='{e.get('dnsQuery', '')}'")
+        if not e.get("dnsQuery"):
             log("  ✗ DNS data is empty!")
             all_ok = False
     else:

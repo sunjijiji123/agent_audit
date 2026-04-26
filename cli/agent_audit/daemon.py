@@ -1,18 +1,32 @@
 """Daemon runner — loads BPF, polls map, writes JSONL with BPF-packed process chain."""
 
 import fnmatch
+import hashlib
 import os
 import sys
 import time
 import signal
 import json
+import uuid
+import functools
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Set, Dict, Any
 
 from .config import load_config, save_config, _get_config_path
 from .bpf_loader import load_bpf, register_pid, update_agent_tree, fetch_events, deduplicate_events, unload_bpf, set_elf_path
 from .log_rotator import make_audit_logger, make_runtime_logger
+
+# DAS-DS constants
+AGENT_AUDIT_NS = uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
+_EVENT_TYPE_MAP = {
+    "FILE": ("fileEvent", 120003),
+    "NET": ("networkConnect", 130001),
+    "DNS": ("dnsQuery", 130003),
+    "FORK": ("processCreate", 110001),
+}
 
 
 def _get_resource_root() -> Path:
@@ -307,6 +321,26 @@ def run_loop() -> None:
 
     seen_events: Set[int] = set()
 
+    # ── DAS-DS helpers ───────────────────────────────────────────────────────
+    def _generate_process_guid(root_pid: int, fork_time_ns: int) -> str:
+        return str(uuid.uuid5(AGENT_AUDIT_NS, f"{root_pid}:{fork_time_ns}"))
+
+    def _generate_logfuz_id(event_type: str, process_id: int, unix_time: int,
+                            op_type: str, data_key: str) -> str:
+        raw = f"{event_type}{process_id}{unix_time}{op_type}{data_key}"
+        return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+    @functools.lru_cache(maxsize=512)
+    def _compute_md5(path: str) -> str:
+        try:
+            h = hashlib.md5()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except (OSError, PermissionError):
+            return ""
+
     # ── BPF timestamp conversion ─────────────────────────────────────────────────
     _boot_to_epoch_ns = 0
     _last_boot_update = 0.0
@@ -337,14 +371,13 @@ def run_loop() -> None:
 
         return _boot_to_epoch_ns
 
-    def _convert_bpf_timestamp(ts_ns: int) -> str:
-        """将 BPF boot time 转换为 ISO8601 字符串."""
-        from datetime import datetime
+    def _convert_bpf_timestamp(ts_ns: int) -> tuple:
+        """将 BPF boot time 转换为 (localTime ISO8601, unixTime epoch秒)."""
         offset = _get_boot_to_epoch_offset()
         epoch_ns = ts_ns + offset
-        seconds = epoch_ns / 1_000_000_000
-        dt = datetime.fromtimestamp(seconds)
-        return dt.isoformat()
+        epoch_s = epoch_ns // 1_000_000_000
+        dt = datetime.fromtimestamp(epoch_s, tz=timezone.utc).astimezone()
+        return dt.isoformat(), epoch_s
 
     # ── Action 推断 ─────────────────────────────────────────────────────
     def _infer_action_from_type(event_type: str) -> str:
@@ -358,8 +391,8 @@ def run_loop() -> None:
 
     # ── /proc 进程信息读取 ─────────────────────────────────────────────
     def _read_proc_info(pid: int) -> Dict:
-        """从 /proc 读取进程的 cmdline, exe, cwd, ppid."""
-        info = {"cmdline": "", "exe": "", "cwd": "", "ppid": 0}
+        """从 /proc 读取进程的 cmdline, exe, cwd, ppid, uid, username."""
+        info = {"cmdline": "", "exe": "", "cwd": "", "ppid": 0, "username": ""}
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as f:
                 info["cmdline"] = f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
@@ -378,6 +411,16 @@ def run_loop() -> None:
                 fields = f.read().split()
                 info["ppid"] = int(fields[3])
         except (FileNotFoundError, ValueError, IndexError):
+            pass
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("Uid:"):
+                        uid = int(line.split()[1])
+                        import pwd
+                        info["username"] = pwd.getpwuid(uid).pw_name
+                        break
+        except (FileNotFoundError, ValueError, IndexError, OSError, KeyError):
             pass
         return info
 
@@ -416,72 +459,106 @@ def run_loop() -> None:
         except (OSError, PermissionError):
             return ""
 
-    # ── Object 字段格式化 ───────────────────────────────────────────────
-    def _format_object(event_type: str, action: str, data: str, pid: int) -> tuple:
-        """根据事件类型和 action 格式化 object 字段，返回 (key, dict)."""
-        if event_type == "FILE":
-            if action in ("read", "write"):
-                # data = "fd=X bytes=Y"
-                fd, nbytes = _parse_fd_bytes(data)
-                path = _resolve_fd_path(pid, fd) if fd >= 0 else ""
-                return "file", {"fd": fd, "bytes": nbytes, "path": path}
-            else:
-                # open 事件, data = 文件路径
-                return "file", {"path": data}
-        elif event_type == "NET":
-            if action in ("send", "recv"):
-                # data = "fd=X bytes=Y"
-                fd, nbytes = _parse_fd_bytes(data)
-                return "network", {"fd": fd, "bytes": nbytes}
-            # connect 事件: C loader 输出 "AF_INET ip:port" 或 "AF_INET6 [...]:port"
-            if data.startswith("AF_INET6"):
-                addr = data[len("AF_INET6 "):]
-                return "network", {"dst": addr, "family": "AF_INET6"}
-            elif data.startswith("AF_INET"):
-                addr = data[len("AF_INET "):]
-                return "network", {"dst": addr, "family": "AF_INET"}
-            else:
-                return "network", {"dst": data, "family": "AF_INET"}
-        elif event_type == "DNS":
-            return "dns", {"query": data}
-        else:
-            return "unknown", {"raw": data}
-
-    # ── 单事件日志构建 ─────────────────────────────────────────────────
+    # ── 单事件日志构建（DAS-DS 扁平格式） ───────────────────────────────
     def _build_single_event_log(event: Dict) -> Dict:
-        """将单个 BPF 事件转换为 JSON-Audit 日志（严格遵循 log-format spec）."""
-        ts_ns = event.get("ts_ns", 0)
-        ts_iso = _convert_bpf_timestamp(ts_ns)
-
+        """将单个 BPF 事件转换为 DAS-DS 扁平 JSON 日志."""
+        bpf_type = event.get("type", "UNKNOWN")
+        action = event.get("action") or _infer_action_from_type(bpf_type)
         pid = event.get("pid", 0)
         comm = event.get("comm", "")
+        data = event.get("data", "")
+        chain = event.get("chain", [])
 
-        # chain: 数组 → spec 字符串格式
-        chain_str = _format_chain_string(event.get("chain", []))
+        # Timestamps
+        ts_ns = event.get("ts_ns", 0)
+        local_time, unix_time = _convert_bpf_timestamp(ts_ns)
 
-        # /proc 进程信息
+        # eventType / rawLogNum mapping
+        event_type, raw_log_num = _EVENT_TYPE_MAP.get(bpf_type, ("unknown", 0))
+
+        # opType (FORK → "create" per DAS-DS spec)
+        if action == "fork":
+            op_type = "create"
+        else:
+            op_type = action
+
+        # Process info from /proc
         proc_info = _read_proc_info(pid)
 
-        # 优先使用 BPF 传来的 action 字段，fallback 到 type 推断
-        action = event.get("action") or _infer_action_from_type(event.get("type", ""))
+        # processGuid (deterministic per PID)
+        process_guid = _generate_process_guid(pid, ts_ns)
 
+        # parentProcessName: chain[1] is direct parent
+        parent_process_name = chain[1]["comm"] if len(chain) >= 2 else ""
+        parent_pid = proc_info["ppid"]
+        parent_process_guid = _generate_process_guid(parent_pid, 0) if parent_pid else ""
+
+        # processMd5 from exe path
+        process_md5 = _compute_md5(proc_info["exe"]) if proc_info["exe"] else ""
+
+        # processChain string
+        process_chain = _format_chain_string(chain)
+
+        # data_key for logfuzId
+        data_key = ""
+        if bpf_type == "FILE":
+            if action in ("read", "write"):
+                fd, nbytes = _parse_fd_bytes(data)
+                data_key = _resolve_fd_path(pid, fd) if fd >= 0 else ""
+            else:
+                data_key = data
+        elif bpf_type == "NET":
+            data_key = data.split(" ", 1)[1] if " " in data else data
+        elif bpf_type == "DNS":
+            data_key = data
+        elif bpf_type == "FORK":
+            data_key = str(parent_pid)
+
+        logfuz_id = _generate_logfuz_id(event_type, pid, unix_time, op_type, data_key)
+
+        # Build flat DAS-DS output
         log_entry = {
-            "ts": ts_iso,
-            "type": event.get("type", "UNKNOWN"),
-            "action": action,
-            "process": {
-                "pid": pid,
-                "comm": comm,
-                "cmdline": proc_info["cmdline"],
-                "exe": proc_info["exe"],
-                "cwd": proc_info["cwd"],
-                "ppid": proc_info["ppid"],
-                "chain": chain_str,
-            }
+            "eventType": event_type,
+            "rawLogNum": raw_log_num,
+            "logType": "agent-audit",
+            "opType": op_type,
+            "localTime": local_time,
+            "unixTime": unix_time,
+            "logfuzId": logfuz_id,
+            "processId": pid,
+            "image": proc_info["exe"],
+            "commandLine": proc_info["cmdline"],
+            "processUserName": proc_info["username"],
+            "processMd5": process_md5,
+            "processName": comm,
+            "parentProcessName": parent_process_name,
+            "processGuid": process_guid,
+            "traceId": "",
+            "parentProcessGuid": parent_process_guid,
+            "parentProcessId": parent_pid,
+            "processChain": process_chain,
+            "processCwd": proc_info["cwd"],
         }
 
-        object_key, object_value = _format_object(event.get("type"), action, event.get("data", ""), pid)
-        log_entry[object_key] = object_value
+        # Event-specific top-level fields
+        if bpf_type == "FILE":
+            if action in ("read", "write"):
+                fd, nbytes = _parse_fd_bytes(data)
+                path = _resolve_fd_path(pid, fd) if fd >= 0 else ""
+                log_entry["filePath"] = path
+                log_entry["fileFd"] = fd
+                log_entry["fileBytes"] = nbytes
+            else:
+                log_entry["filePath"] = data
+        elif bpf_type == "NET":
+            if data.startswith("AF_INET6 "):
+                log_entry["networkDst"] = data[len("AF_INET6 "):]
+            elif data.startswith("AF_INET "):
+                log_entry["networkDst"] = data[len("AF_INET "):]
+            else:
+                log_entry["networkDst"] = data
+        elif bpf_type == "DNS":
+            log_entry["dnsQuery"] = data
 
         return log_entry
 
@@ -525,7 +602,7 @@ def run_loop() -> None:
 
             # Filter out noisy read/write events with meaningless paths
             if event.get("type") == "FILE" and event.get("action") in ("read", "write"):
-                path = log_entry.get("file", {}).get("path", "")
+                path = log_entry.get("filePath", "")
                 if not path or path.startswith("/dev/pts/") or path.startswith("socket:") or path.startswith("pipe:"):
                     continue
 

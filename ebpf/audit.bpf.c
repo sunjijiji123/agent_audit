@@ -19,12 +19,13 @@
 #define MAX_DATA_LEN      256
 #define MAX_CHAIN_DEPTH   8
 
-enum { EVENT_TYPE_FILE = 1, EVENT_TYPE_NETWORK = 2, EVENT_TYPE_DNS = 3 };
+enum { EVENT_TYPE_FILE = 1, EVENT_TYPE_NETWORK = 2, EVENT_TYPE_DNS = 3, EVENT_TYPE_FORK = 4 };
 
 enum {
     ACTION_OPEN = 0, ACTION_READ = 1, ACTION_WRITE = 2,
     ACTION_CONNECT = 3,
-    ACTION_RESOLVE = 4
+    ACTION_RESOLVE = 4,
+    ACTION_FORK = 5
 };
 
 struct chain_node {
@@ -299,6 +300,22 @@ int handle_sched_process_fork(struct sched_process_fork_ctx *ctx) {
     child_node.fork_time = bpf_ktime_get_ns();
     bpf_get_current_comm(child_node.comm, MAX_COMM_LEN);
     bpf_map_update_elem(&agent_tree, &child_pid, &child_node, 0);
+
+    // Emit fork event
+    {
+        __u32 zero = 0;
+        struct audit_event *fev = bpf_map_lookup_elem(&event_scratch, &zero);
+        if (fev) {
+            __builtin_memset(fev, 0, sizeof(*fev));
+            fev->event_type = EVENT_TYPE_FORK;
+            fev->action_type = ACTION_FORK;
+            fev->pid = child_pid;
+            fev->timestamp_ns = bpf_ktime_get_ns();
+            __builtin_memcpy(fev->comm, child_node.comm, MAX_COMM_LEN);
+            fev->chain_depth = 0;
+            bpf_map_update_elem(&events, &fev->timestamp_ns, fev, 0);
+        }
+    }
 
     return 0;
 }
