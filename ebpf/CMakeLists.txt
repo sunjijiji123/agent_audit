@@ -34,14 +34,24 @@ include(cmake/DownloadLibbpf.cmake)
 set(BPF_SRC audit.bpf.c)
 set(BPF_OBJ audit.bpf.o)
 
+# Find llvm-strip
+find_program(LLVM_STRIP NAMES llvm-strip llvm-strip-14 llvm-strip-15)
+
 add_custom_target(bpf_program ALL
     COMMAND clang -g -O2 -target bpf -D__TARGET_ARCH_${BPF_ARCH} -c
             ${CMAKE_CURRENT_SOURCE_DIR}/${BPF_SRC} -o ${CMAKE_CURRENT_BINARY_DIR}/${BPF_OBJ}
-    COMMAND sh -c "llvm-strip -g ${CMAKE_CURRENT_BINARY_DIR}/${BPF_OBJ} 2>/dev/null || true"
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${BPF_SRC}
     COMMENT "Building eBPF program: ${BPF_OBJ}"
     BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/${BPF_OBJ}
 )
+
+# Optional: strip debug info if llvm-strip found
+if(LLVM_STRIP)
+    add_custom_command(TARGET bpf_program POST_BUILD
+        COMMAND ${LLVM_STRIP} -g ${CMAKE_CURRENT_BINARY_DIR}/${BPF_OBJ}
+        COMMENT "Stripping debug symbols from BPF object"
+    )
+endif()
 
 # Loader shared library
 set(LOADER_SRC loader.c)

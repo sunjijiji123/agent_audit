@@ -16,13 +16,14 @@ add_custom_target(libbpf ALL
         NO_PKG_CONFIG=1
         CC=${CMAKE_C_COMPILER}
         AR=${CMAKE_AR}
-        CFLAGS=${CMAKE_C_FLAGS}
+        EXTRA_CFLAGS=-fPIC
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "Building libbpf ${LIBBPF_VERSION} static library"
+    COMMENT "Building libbpf ${LIBBPF_VERSION} static library with -fPIC"
     BYPRODUCTS ${CMAKE_BINARY_DIR}/libbpf-build/libbpf.a
 )
 
 set(LIBBPF_INCLUDE_DIRS
+    ${LIBBPF_SRC_DIR}/src
     ${LIBBPF_SRC_DIR}/include
     ${LIBBPF_SRC_DIR}/include/uapi
 )
