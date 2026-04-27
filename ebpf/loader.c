@@ -168,9 +168,6 @@ int bpf_load(void) {
     if (g_events_fd < 0)
         fprintf(stderr, "[loader] Warning: events map not found\n");
 
-    /* Discover libc for DNS uprobe */
-    discover_libc_path();
-
     fprintf(stderr, "[loader] BPF program loaded and attached successfully\n");
     return 0;
 }
@@ -356,9 +353,7 @@ const char *bpf_dump_events(void) {
             case 1: action_str = "read"; break;
             case 2: action_str = "write"; break;
             case 3: action_str = "connect"; break;
-            case 4: action_str = "send"; break;
-            case 5: action_str = "recv"; break;
-            case 6: action_str = "resolve"; break;
+            case 4: action_str = "resolve"; break;
             case 5: action_str = "fork"; break;
         }
 

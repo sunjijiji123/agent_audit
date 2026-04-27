@@ -185,9 +185,16 @@ int handle_connect(struct sys_enter_connect_ctx *ctx) {
 }
 
 /* DNS uprobe — intercepts getaddrinfo() in glibc
- * Uses bpf_probe_read_kernel to extract args from pt_regs (uprobe context) */
+ * Uses bpf_probe_read_kernel to extract args from pt_regs (uprobe context)
+ *
+ * Section format: uprobe/<path>:<symbol> — libbpf auto-attaches based on section name
+ */
 
+#if defined(__TARGET_ARCH_arm64)
 SEC("uprobe//lib/aarch64-linux-gnu/libc.so.6:getaddrinfo")
+#else
+SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:getaddrinfo")
+#endif
 int trace_getaddrinfo(struct pt_regs *ctx)
 {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
@@ -301,7 +308,7 @@ int handle_sched_process_fork(struct sched_process_fork_ctx *ctx) {
     bpf_get_current_comm(child_node.comm, MAX_COMM_LEN);
     bpf_map_update_elem(&agent_tree, &child_pid, &child_node, 0);
 
-    // Emit fork event
+    // Emit fork event (with process chain)
     {
         __u32 zero = 0;
         struct audit_event *fev = bpf_map_lookup_elem(&event_scratch, &zero);
@@ -312,7 +319,10 @@ int handle_sched_process_fork(struct sched_process_fork_ctx *ctx) {
             fev->pid = child_pid;
             fev->timestamp_ns = bpf_ktime_get_ns();
             __builtin_memcpy(fev->comm, child_node.comm, MAX_COMM_LEN);
-            fev->chain_depth = 0;
+
+            // Pack process chain (includes parent chain)
+            pack_process_chain(child_pid, &child_entry, fev);
+
             bpf_map_update_elem(&events, &fev->timestamp_ns, fev, 0);
         }
     }
