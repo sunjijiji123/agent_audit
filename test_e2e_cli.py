@@ -212,8 +212,8 @@ def main():
     # Check DNS events
     if dns_events:
         e = dns_events[0]
-        log(f"  ✓ DNS: query='{e.get('dnsQuery', '')}'")
-        if not e.get("dnsQuery"):
+        log(f"  ✓ DNS: query='{e.get('requestDomain', '')}'")
+        if not e.get("requestDomain"):
             log("  ✗ DNS data is empty!")
             all_ok = False
     else:

@@ -519,19 +519,39 @@ def run_loop() -> None:
         # opType (FORK → "create" per DAS-DS spec)
         if action == "fork":
             op_type = "create"
+        elif bpf_type == "DNS":
+            # DNS events use "connect" per DAS-DS spec (not "resolve")
+            op_type = "connect"
         else:
             op_type = action
 
         # Process info from /proc (cached)
         proc_info = _get_proc_info(pid)
 
-        # processGuid (deterministic per PID)
-        process_guid = _generate_process_guid(pid, ts_ns)
+        # root_pid from chain (last element is root), fallback to pid
+        root_pid = chain[-1]["pid"] if chain else pid
+
+        # fork_time from agent_tree for stable GUID
+        tree_entry = lookup_agent_tree(pid)
+        fork_time_ns = tree_entry["fork_time"] if tree_entry else 0
+
+        process_guid = _generate_process_guid(root_pid, fork_time_ns)
 
         # parentProcessName: chain[1] is direct parent
         parent_process_name = chain[1]["comm"] if len(chain) >= 2 else ""
-        parent_pid = proc_info["ppid"]
-        parent_process_guid = _generate_process_guid(parent_pid, 0) if parent_pid else ""
+
+        # parent_pid: prefer agent_tree for fork events, then chain, then /proc
+        if bpf_type == "FORK":
+            # For fork events, parent_pid from agent_tree (BPF filled it)
+            parent_pid = tree_entry["parent_pid"] if tree_entry else 0
+        else:
+            parent_pid = proc_info["ppid"]
+
+        parent_process_guid = ""
+        if parent_pid:
+            parent_tree = lookup_agent_tree(parent_pid)
+            parent_fork_time = parent_tree["fork_time"] if parent_tree else 0
+            parent_process_guid = _generate_process_guid(root_pid, parent_fork_time)
 
         # processMd5 from exe path
         process_md5 = _compute_md5(proc_info["exe"]) if proc_info["exe"] else ""
@@ -557,10 +577,18 @@ def run_loop() -> None:
         logfuz_id = _generate_logfuz_id(event_type, pid, unix_time, op_type, data_key)
 
         # Build flat DAS-DS output
+        # logType mapping per DAS-DS spec
+        log_type_map = {
+            "processCreate": "process",
+            "fileEvent": "file",
+            "networkConnect": "network",
+            "dnsQuery": "domain",
+        }
+
         log_entry = {
             "eventType": event_type,
             "rawLogNum": raw_log_num,
-            "logType": "agent-audit",
+            "logType": log_type_map.get(event_type, "agent-audit"),
             "opType": op_type,
             "localTime": local_time,
             "unixTime": unix_time,
@@ -577,7 +605,7 @@ def run_loop() -> None:
             "parentProcessGuid": parent_process_guid,
             "parentProcessId": parent_pid,
             "processChain": process_chain,
-            "processCwd": proc_info["cwd"],
+            "currentDirectory": proc_info["cwd"],
         }
 
         # Event-specific top-level fields
@@ -598,7 +626,7 @@ def run_loop() -> None:
             else:
                 log_entry["networkDst"] = data
         elif bpf_type == "DNS":
-            log_entry["dnsQuery"] = data
+            log_entry["requestDomain"] = data
 
         return log_entry
 
