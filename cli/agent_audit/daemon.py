@@ -535,7 +535,7 @@ def run_loop() -> None:
         tree_entry = lookup_agent_tree(pid)
         fork_time_ns = tree_entry["fork_time"] if tree_entry else 0
 
-        process_guid = _generate_process_guid(root_pid, fork_time_ns)
+        process_guid = ""
 
         # parentProcessName: chain[1] is direct parent
         parent_process_name = chain[1]["comm"] if len(chain) >= 2 else ""
@@ -548,22 +548,15 @@ def run_loop() -> None:
             parent_pid = proc_info["ppid"]
 
         parent_process_guid = ""
-        if parent_pid:
-            parent_tree = lookup_agent_tree(parent_pid)
-            parent_fork_time = parent_tree["fork_time"] if parent_tree else 0
-            parent_process_guid = _generate_process_guid(root_pid, parent_fork_time)
 
         # processMd5 from exe path
         process_md5 = _compute_md5(proc_info["exe"]) if proc_info["exe"] else ""
-
-        # processChain string
-        process_chain = _format_chain_string(chain)
 
         # data_key for logfuzId
         data_key = ""
         if bpf_type == "FILE":
             if action in ("read", "write"):
-                fd, nbytes = _parse_fd_bytes(data)
+                fd, _ = _parse_fd_bytes(data)
                 data_key = _resolve_fd_path(pid, fd) if fd >= 0 else ""
             else:
                 data_key = data
@@ -604,18 +597,15 @@ def run_loop() -> None:
             "traceId": "",
             "parentProcessGuid": parent_process_guid,
             "parentProcessId": parent_pid,
-            "processChain": process_chain,
             "currentDirectory": proc_info["cwd"],
         }
 
         # Event-specific top-level fields
         if bpf_type == "FILE":
             if action in ("read", "write"):
-                fd, nbytes = _parse_fd_bytes(data)
+                fd, _ = _parse_fd_bytes(data)
                 path = _resolve_fd_path(pid, fd) if fd >= 0 else ""
                 log_entry["filePath"] = path
-                log_entry["fileFd"] = fd
-                log_entry["fileBytes"] = nbytes
             else:
                 log_entry["filePath"] = data
         elif bpf_type == "NET":
