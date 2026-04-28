@@ -23,11 +23,11 @@
   "processMd5": "...",               ✓ 已实现
   "processName": "ls",               ✓ 已实现
   "processStartTime": "...",         ❌ 缺失
-  "processGuid": "...",              ✓ 已实现（UUID5格式）
+  "processGuid": "...",              ⏳ 待实现（当前为空字符串）
 
   // 父进程信息
   "parentProcessName": "bash",       ✓ 已实现（从chain）
-  "parentProcessGuid": "...",        ✓ 已实现
+  "parentProcessGuid": "...",        ⏳ 待实现（当前为空字符串）
   "parentProcessId": "26210",        ✓ 已实现
   "parentImage": "/usr/bin/bash",    ❌ 缺失
   "parentCommandLine": "-bash ",     ❌ 缺失
