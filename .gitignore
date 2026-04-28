@@ -41,6 +41,7 @@ tmp/
 # 构建产物
 build/
 dist/
+build.spec
 
 # 日志
 *.log
