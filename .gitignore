@@ -24,8 +24,19 @@ __pycache__/
 *.so
 *.skel.h
 ebpf/bpf_map_dump
+ebpf/bpf_map_dump-static
 ebpf/loader.so
 ebpf/audit.bpf.o
+ebpf/test_loader.c
+
+# FUSE 临时文件
+ebpf/.fuse_hidden*
+
+# libbpf 构建目录
+ebpf/libbpf/
+
+# 临时目录
+tmp/
 
 # 构建产物
 build/
