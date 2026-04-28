@@ -63,11 +63,7 @@ class AuditLogger:
 
     def log_event(self, event: Dict[str, Any]) -> None:
         """Write a single audit event as a JSON line (FILE/NET/DNS only)."""
-        record = dict(event)
-        # Ensure ts field (for daemon startup/shutdown events)
-        if "ts" not in record:
-            record["ts"] = datetime.now().isoformat()
-        self.logger.info(json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str))
+        self.logger.info(json.dumps(event, ensure_ascii=False, separators=(",", ":"), default=str))
 
     def log_events_batch(self, events: List[Dict]) -> None:
         """Write multiple events in batch."""
