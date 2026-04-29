@@ -79,7 +79,7 @@ python3 -m cli.cli audit list                 # 查看监控目标
 
 1. 系统调用触发 → BPF 查 `pid_whitelist` → 匹配则用 `event_scratch` 填充 `audit_event` 结构体 → 遍历 `agent_tree` 构建进程链（最多 8 级祖先，通过 `CHAIN_STEP` 宏展开，满足 BPF 验证器要求） → 插入 `events` map
 2. Python 守护进程每 N 秒轮询 → `loader.so` 用 `bpf_map_lookup_and_delete_elem` 遍历 `events` map（破坏性读取）→ 通过 256KB 静态缓冲区返回 JSON 数组
-3. Python 按 `ts_ns` 去重，从 `/proc/{pid}/` 补充信息（cmdline、exe、cwd、ppid），将 BPF 启动时间转换为 ISO8601，写入 JSONL
+3. Python 按 `ts_ns` 去重，从 `/proc/{pid}/` 补充信息（cmdline、exe、ppid），将 BPF 启动时间转换为 `"YYYY-MM-DD HH:MM:SS"` 格式，写入 JSONL
 
 ### 关键文件
 
@@ -129,3 +129,44 @@ python3 -m cli.cli audit list                 # 查看监控目标
 - 将任务转化为可验证的目标和明确的成功标准。
 - 多步骤任务先列出计划，标注每步的验证点。
 - 循环直到验证通过。
+
+## DAS-DS 日志格式示例
+
+FILE open 事件示例：
+```json
+{
+  "eventType": "fileEvent",
+  "rawLogNum": 120003,
+  "logType": "file",
+  "opType": "open",
+  "localTime": "2025-12-23 10:57:29",
+  "unixTime": 1734940649,
+  "logfuzId": "",
+  "processId": "12345",
+  "image": "/usr/bin/python3.10",
+  "commandLine": "python3 script.py",
+  "processUserName": "root",
+  "processMd5": "",
+  "processName": "python3",
+  "parentProcessName": "bash",
+  "processGuid": "",
+  "traceId": "",
+  "parentProcessGuid": "",
+  "parentProcessId": "1000",
+  "filePath": "/root/script.py",
+  "fileSize": 1024,
+  "fileType": "",
+  "modifyTime": "2025-12-20 15:30:00",
+  "fileMd5": "",
+  "createTime": "",
+  "targetFilename": ""
+}
+```
+
+字段说明：
+- `localTime`: `"YYYY-MM-DD HH:MM:SS"` 格式（空格分隔，无时区后缀）
+- `filePath`: 仅文件路径（目录和符号链接被过滤）
+- `processId`/`parentProcessId`: **字符串格式**（如 `"12345"`，不是整数）
+- `fileSize/fileType/modifyTime`: 仅 FILE open 事件（read/write 不采集）
+- `processMd5/logfuzId`: 空字符串（计算 deferred）
+- `currentDirectory`: 不存在（已删除字段）
