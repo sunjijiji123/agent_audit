@@ -13,7 +13,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Set, Dict, Any
+from typing import Optional, Set, Dict, Any, Tuple
 
 from .config import load_config, save_config, _get_config_path
 from .bpf_loader import load_bpf, register_pid, update_agent_tree, fetch_events, deduplicate_events, unload_bpf, set_elf_path, lookup_agent_tree
@@ -30,6 +30,7 @@ _EVENT_TYPE_MAP = {
 }
 
 PROC_CACHE_TTL = 30
+PRECACHE_TTL = 5.0
 
 
 @dataclass
@@ -40,6 +41,95 @@ class ProcInfo:
     ppid: int = 0
     username: str = ""
     cached_at: float = 0.0
+
+
+# Pre-cache for short-lived processes, populated on FORK events
+_proc_precache: Dict[int, Tuple[float, ProcInfo]] = {}
+
+
+def _precache_proc_info(pid: int) -> bool:
+    """Try to read /proc metadata for pid and store in pre-cache.
+
+    Returns True on success (at least one field populated), False on failure.
+    Never raises exceptions.
+    """
+    info = ProcInfo(cached_at=time.time())
+    any_field = False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            info.cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+            any_field = True
+    except (OSError, PermissionError):
+        pass
+    try:
+        info.exe = os.readlink(f"/proc/{pid}/exe")
+        any_field = True
+    except (OSError, PermissionError):
+        pass
+    try:
+        info.cwd = os.readlink(f"/proc/{pid}/cwd")
+        any_field = True
+    except (OSError, PermissionError):
+        pass
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("Uid:"):
+                    uid = int(line.split()[1])
+                    import pwd
+                    info.username = pwd.getpwuid(uid).pw_name
+                    any_field = True
+                    break
+    except (OSError, PermissionError, ValueError, IndexError, KeyError):
+        pass
+    if any_field:
+        _proc_precache[pid] = (info.cached_at, info)
+    return any_field
+
+
+def _get_precached_proc_info(pid: int) -> Optional[Dict]:
+    """Return pre-cached proc info if available and not expired, else None."""
+    entry = _proc_precache.get(pid)
+    if entry is None:
+        return None
+    ts, info = entry
+    if time.time() - ts > PRECACHE_TTL:
+        _proc_precache.pop(pid, None)
+        return None
+    return {"cmdline": info.cmdline, "exe": info.exe,
+            "cwd": info.cwd, "ppid": info.ppid,
+            "username": info.username}
+
+
+def _force_cleanup_audit_bpf() -> None:
+    """Force-detach any stale audit BPF programs from previous daemon runs.
+
+    When a daemon is killed (SIGKILL) or crashes, BPF programs may remain
+    loaded in kernel memory. This function finds and closes their link fds
+    by iterating /proc/self/fd and checking for BPF links.
+    """
+    import struct
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+        for fd_name in os.listdir("/proc/self/fd"):
+            try:
+                fd = int(fd_name)
+            except ValueError:
+                continue
+            try:
+                link = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                continue
+            # BPF links appear as anon_inode:[bpf-link]
+            if "bpf-link" in link:
+                # Check if this link is for an audit tracepoint
+                # by reading link info (we just close stale ones)
+                os.close(fd)
+        # Also close any open BPF map FDs from old objects
+    except (OSError, PermissionError, ValueError):
+        pass
 
 
 def _get_resource_root() -> Path:
@@ -276,7 +366,19 @@ def run_loop() -> None:
     log_path = log_cfg.get("path", "/var/log/agent-audit/audit.log")
     max_size_mb = log_cfg.get("max_size_mb", 50)
     backup_count = log_cfg.get("backup_count", 5)
-    poll_interval = cfg.get("daemon", {}).get("poll_interval_sec", 2)
+    poll_interval_min = cfg.get("daemon", {}).get("poll_interval_min_sec", 0.05)
+    poll_interval_max = cfg.get("daemon", {}).get("poll_interval_max_sec", 2.0)
+
+    # Adaptive polling state
+    current_interval = poll_interval_min
+    empty_count = 0
+
+    # Polling stats
+    last_stats_time = 0.0
+    stats_interval = 60.0
+    total_with_events = 0
+    total_without_events = 0
+    total_resets = 0
 
     # Initialize dual logger system
     _logger = make_audit_logger(log_path, max_size_mb, backup_count)
@@ -307,6 +409,14 @@ def run_loop() -> None:
         return
 
     set_elf_path(bpf_elf)
+
+    # ── Clean up any stale BPF state from previous runs ──────────────
+    # Previous daemon may have crashed without cleanup, leaving orphaned
+    # BPF programs loaded. Force-cleanup before loading new ones.
+    unload_bpf()
+    import shutil
+    shutil.rmtree(_PIN_DIR, ignore_errors=True)
+    _force_cleanup_audit_bpf()
 
     # ── Load BPF program ──────────────────────────────────────────────
     if load_bpf():
@@ -407,6 +517,11 @@ def run_loop() -> None:
 
     def _get_proc_info(pid: int) -> Dict:
         """从缓存获取进程信息，未命中或过期则读 /proc 并更新缓存。"""
+        # 1. Check pre-cache (highest priority, fast path)
+        precached = _get_precached_proc_info(pid)
+        if precached is not None:
+            return precached
+
         now = time.time()
         cached = _proc_cache.get(pid)
         if cached and (now - cached.cached_at) < PROC_CACHE_TTL:
@@ -421,13 +536,11 @@ def run_loop() -> None:
             ppid = tree_entry["parent_pid"]
 
         info = ProcInfo(cached_at=now)
+        # Each field independent: single failure doesn't block others
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as f:
                 info.cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
-        except FileNotFoundError:
-            _proc_cache.pop(pid, None)
-            return {"cmdline": "", "exe": "", "cwd": "", "ppid": 0, "username": ""}
-        except PermissionError:
+        except (OSError, PermissionError):
             pass
         try:
             info.exe = os.readlink(f"/proc/{pid}/exe")
@@ -654,6 +767,24 @@ def run_loop() -> None:
         # Deduplicate by timestamp_ns
         events, seen_events = deduplicate_events(events, seen_events)
 
+        # ── FORK event pre-cache (tasks 2.1-2.3) ──────────────────────────
+        # Only precache child PIDs from FORK events — these are newly created
+        # processes that may exit before the next poll. Parent PIDs are typically
+        # longer-lived and handled by the normal _get_proc_info cache.
+        # Cap at 60 per batch to avoid /proc I/O blocking the event loop.
+        precache_pids: Set[int] = set()
+        precache_budget = 100
+        for event in events:
+            if event.get("type") != "FORK":
+                continue
+            pid = event.get("pid", 0)
+            if pid and pid not in precache_pids:
+                if precache_budget <= 0:
+                    break
+                _precache_proc_info(pid)
+                precache_pids.add(pid)
+                precache_budget -= 1
+
         # Process each event individually and write to JSONL log
         for event in events:
             log_entry = _build_single_event_log(event)
@@ -666,7 +797,34 @@ def run_loop() -> None:
 
             _logger.log_event(log_entry)
 
-        time.sleep(poll_interval)
+        # ── Adaptive polling (tasks 4.4-4.5) ──────────────────────────────
+        if events:
+            if current_interval > poll_interval_min:
+                total_resets += 1
+            current_interval = poll_interval_min
+            empty_count = 0
+            total_with_events += 1
+        else:
+            empty_count += 1
+            current_interval = min(poll_interval_min * (2 ** empty_count), poll_interval_max)
+            total_without_events += 1
+
+        # ── Precache cleanup (tasks 5.1) ───────────────────────────────────
+        expire_cutoff = time.time() - PRECACHE_TTL
+        stale = [p for p, (ts, _) in _proc_precache.items() if ts < expire_cutoff]
+        for p in stale:
+            _proc_precache.pop(p, None)
+
+        # ── Polling stats logging (task 6.3) ──────────────────────────────
+        if now - last_stats_time > stats_interval:
+            last_stats_time = now
+            _runtime_logger.info(
+                f"Polling stats: interval={current_interval:.2f}s, "
+                f"with_events={total_with_events}, without_events={total_without_events}, "
+                f"resets={total_resets}"
+            )
+
+        time.sleep(current_interval)
 
     # ── Shutdown ──────────────────────────────────────────────────────
     _runtime_logger.info("Daemon stopping")

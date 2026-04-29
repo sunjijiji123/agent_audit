@@ -194,14 +194,6 @@ def config_cmd(args) -> None:
         cfg.setdefault("log", {})["backup_count"] = args.log_backup
         print(f"log.backup_count = {args.log_backup}")
         updated = True
-    if args.bpf_elf:
-        cfg.setdefault("daemon", {})["bpf_elf"] = args.bpf_elf
-        print(f"daemon.bpf_elf = {args.bpf_elf}")
-        updated = True
-    if args.poll_interval:
-        cfg.setdefault("daemon", {})["poll_interval_sec"] = args.poll_interval
-        print(f"daemon.poll_interval_sec = {args.poll_interval}")
-        updated = True
 
     if updated:
         save_config(cfg, _config_path)
@@ -260,8 +252,6 @@ def main() -> None:
     p_conf.add_argument("--log-path", metavar="PATH")
     p_conf.add_argument("--log-size", type=int, metavar="MB")
     p_conf.add_argument("--log-backup", type=int, metavar="N")
-    p_conf.add_argument("--bpf-elf", metavar="PATH")
-    p_conf.add_argument("--poll-interval", type=float, metavar="SEC")
     p_conf.set_defaults(fn=config_cmd)
 
     args = parser.parse_args()
