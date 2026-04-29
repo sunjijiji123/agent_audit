@@ -39,6 +39,8 @@ find_program(LLVM_STRIP NAMES llvm-strip llvm-strip-14 llvm-strip-15)
 
 add_custom_target(bpf_program ALL
     COMMAND clang -g -O2 -target bpf -D__TARGET_ARCH_${BPF_ARCH} -c
+            -I${CMAKE_CURRENT_SOURCE_DIR}
+            -I${LIBBPF_SRC_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/${BPF_SRC} -o ${CMAKE_CURRENT_BINARY_DIR}/${BPF_OBJ}
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${BPF_SRC}
     COMMENT "Building eBPF program: ${BPF_OBJ}"
