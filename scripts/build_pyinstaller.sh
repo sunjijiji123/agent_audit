@@ -33,9 +33,10 @@ chmod +x dist/agent_audit/install.sh dist/agent_audit/uninstall.sh
 # Remove stale config.json from bundle (config lives outside)
 rm -f dist/agent_audit/_internal/config.json
 
-# Move to arch-specific directory
+# Copy to arch-specific directory (cp+rm is safer than mv on VMware hgfs)
 mkdir -p "dist/$ARCH"
-mv dist/agent_audit "dist/$ARCH/"
+cp -r dist/agent_audit "dist/$ARCH/"
+rm -rf dist/agent_audit
 
 echo "[OK] PyInstaller build complete ($ARCH)"
 echo "  Output: $PROJECT_ROOT/dist/$ARCH/agent_audit/"

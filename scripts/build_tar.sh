@@ -19,7 +19,12 @@ fi
 
 echo "[STEP] Creating tarball (arch=$ARCH)..."
 rm -f "$TAR_NAME"
-tar czf "$TAR_NAME" -C "dist/$ARCH" agent_audit
+
+# Stage to local fs to avoid hgfs "file changed" warnings
+STAGE=$(mktemp -d /tmp/agent-audit-tar.XXXXXX)
+cp -r "dist/$ARCH/agent_audit" "$STAGE/"
+tar czf "$TAR_NAME" -C "$STAGE" agent_audit
+rm -rf "$STAGE"
 
 echo "[OK] Tarball created: $TAR_NAME"
 ls -lh "$TAR_NAME"
