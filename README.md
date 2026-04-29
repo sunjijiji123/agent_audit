@@ -210,8 +210,3 @@ GPL-2.0
 ## 作者
 
 sunjijiji123
-
-## 链接
-
-- GitHub: https://github.com/sunjijiji123/agent_audit
-- Gitee: https://gitee.com/sunjiming/audit_ebpf
