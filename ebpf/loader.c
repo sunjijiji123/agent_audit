@@ -54,6 +54,7 @@ static struct bpf_object *g_obj = NULL;
 static int g_pid_whitelist_fd = -1;
 static int g_agent_tree_fd = -1;
 static int g_events_fd = -1;
+static int g_target_comms_fd = -1;
 static char g_libc_path[512] = {0};
 static int g_is_musl = 0;
 
@@ -160,6 +161,7 @@ int bpf_load(void) {
     g_pid_whitelist_fd = bpf_object__find_map_fd_by_name(g_obj, "pid_whitelist");
     g_agent_tree_fd = bpf_object__find_map_fd_by_name(g_obj, "agent_tree");
     g_events_fd = bpf_object__find_map_fd_by_name(g_obj, "events");
+    g_target_comms_fd = bpf_object__find_map_fd_by_name(g_obj, "target_comms");
 
     if (g_pid_whitelist_fd < 0)
         fprintf(stderr, "[loader] Warning: pid_whitelist map not found\n");
@@ -179,6 +181,7 @@ void bpf_unload(void) {
         g_pid_whitelist_fd = -1;
         g_agent_tree_fd = -1;
         g_events_fd = -1;
+        g_target_comms_fd = -1;
         fprintf(stderr, "[loader] BPF program unloaded\n");
     }
 }
@@ -253,6 +256,52 @@ int bpf_map_lookup_agent_tree(unsigned int pid, struct tree_node *out) {
         return -1;
     }
     return bpf_map_lookup_elem(g_agent_tree_fd, &pid, out);
+}
+
+int bpf_map_update_target_comm(const char *comm) {
+    char key[MAX_COMM_LEN];
+    __u8 value = 1;
+
+    if (!g_obj || g_target_comms_fd < 0) {
+        fprintf(stderr, "[loader] BPF not loaded or target_comms not found\n");
+        return -1;
+    }
+
+    memset(key, 0, sizeof(key));
+    if (comm) strncpy(key, comm, MAX_COMM_LEN - 1);
+
+    return bpf_map_update_elem(g_target_comms_fd, key, &value, BPF_ANY);
+}
+
+int bpf_map_delete_target_comm(const char *comm) {
+    char key[MAX_COMM_LEN];
+
+    if (!g_obj || g_target_comms_fd < 0) {
+        fprintf(stderr, "[loader] BPF not loaded or target_comms not found\n");
+        return -1;
+    }
+
+    memset(key, 0, sizeof(key));
+    if (comm) strncpy(key, comm, MAX_COMM_LEN - 1);
+
+    int err = bpf_map_delete_elem(g_target_comms_fd, key);
+    if (err && err != -ENOENT) {
+        fprintf(stderr, "[loader] Failed to delete target comm: %d\n", err);
+        return err;
+    }
+
+    return 0;
+}
+
+int bpf_map_clear_target_comms(void) {
+    char key[MAX_COMM_LEN];
+
+    if (!g_obj || g_target_comms_fd < 0) return -1;
+
+    while (bpf_map_get_next_key(g_target_comms_fd, NULL, &key) == 0) {
+        bpf_map_delete_elem(g_target_comms_fd, &key);
+    }
+    return 0;
 }
 
 /* ============================================================

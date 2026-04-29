@@ -83,6 +83,13 @@ struct {
     __type(value, struct audit_event);
 } event_scratch SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 64);
+    __uint(key_size, MAX_COMM_LEN);
+    __uint(value_size, 1);
+} target_comms SEC(".maps");
+
 struct sys_enter_openat_ctx {
     unsigned char pad[24];   // common fields + __syscall_nr + dfd
     const char *filename;
@@ -341,13 +348,35 @@ int handle_sched_process_exec(struct sched_process_exec_ctx *ctx) {
     __u32 pid = ctx->pid;
 
     struct whitelist_entry *entry = bpf_map_lookup_elem(&pid_whitelist, &pid);
-    if (!entry) return 0;  // Not in whitelist, skip
-
-    struct tree_node *node = bpf_map_lookup_elem(&agent_tree, &pid);
-    if (node) {
-        bpf_get_current_comm(node->comm, MAX_COMM_LEN);
-        bpf_map_update_elem(&agent_tree, &pid, node, 0);
+    if (entry) {
+        // Already in whitelist — update comm in agent_tree
+        struct tree_node *node = bpf_map_lookup_elem(&agent_tree, &pid);
+        if (node) {
+            bpf_get_current_comm(node->comm, MAX_COMM_LEN);
+            bpf_map_update_elem(&agent_tree, &pid, node, 0);
+        }
+        return 0;
     }
+
+    // Not in whitelist — check target_comms for exec-time matching
+    char comm[MAX_COMM_LEN] = {};
+    bpf_get_current_comm(comm, MAX_COMM_LEN);
+    __u8 *found = bpf_map_lookup_elem(&target_comms, comm);
+    if (!found) return 0;
+
+    // Match: add to pid_whitelist as root (depth=0, root_pid=self)
+    struct whitelist_entry new_entry;
+    __builtin_memset(&new_entry, 0, sizeof(new_entry));
+    new_entry.root_pid = pid;
+    new_entry.depth = 0;
+    bpf_map_update_elem(&pid_whitelist, &pid, &new_entry, 0);
+
+    // Add to agent_tree (parent_pid=0, no parent for exec-matched root)
+    struct tree_node new_node;
+    __builtin_memset(&new_node, 0, sizeof(new_node));
+    new_node.fork_time = bpf_ktime_get_ns();
+    __builtin_memcpy(new_node.comm, comm, MAX_COMM_LEN);
+    bpf_map_update_elem(&agent_tree, &pid, &new_node, 0);
 
     return 0;
 }

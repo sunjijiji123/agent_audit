@@ -90,6 +90,15 @@ class _BPFLoaderLib:
                 ctypes.POINTER(TreeNode),
             ]
 
+            cls._lib.bpf_map_update_target_comm.restype = ctypes.c_int
+            cls._lib.bpf_map_update_target_comm.argtypes = [ctypes.c_char_p]
+
+            cls._lib.bpf_map_delete_target_comm.restype = ctypes.c_int
+            cls._lib.bpf_map_delete_target_comm.argtypes = [ctypes.c_char_p]
+
+            cls._lib.bpf_map_clear_target_comms.restype = ctypes.c_int
+            cls._lib.bpf_map_clear_target_comms.argtypes = []
+
             cls._initialized = True
             return True
         except Exception:
@@ -243,6 +252,39 @@ def lookup_agent_tree(pid: int) -> Optional[Dict]:
         "comm": node.comm.decode("utf-8", errors="replace").rstrip("\x00"),
         "fork_time": node.fork_time,
     }
+
+
+def update_target_comm(comm: str) -> bool:
+    """Add a comm name to the target_comms BPF map for exec-time matching."""
+    lib = _BPFLoaderLib.get()
+    if not lib:
+        return False
+    try:
+        return lib.bpf_map_update_target_comm(comm.encode("utf-8")) == 0
+    except Exception:
+        return False
+
+
+def delete_target_comm(comm: str) -> bool:
+    """Remove a comm name from the target_comms BPF map."""
+    lib = _BPFLoaderLib.get()
+    if not lib:
+        return False
+    try:
+        return lib.bpf_map_delete_target_comm(comm.encode("utf-8")) == 0
+    except Exception:
+        return False
+
+
+def clear_target_comms() -> bool:
+    """Clear all entries from the target_comms BPF map."""
+    lib = _BPFLoaderLib.get()
+    if not lib:
+        return False
+    try:
+        return lib.bpf_map_clear_target_comms() == 0
+    except Exception:
+        return False
 
 
 def fetch_events() -> List[Dict]:

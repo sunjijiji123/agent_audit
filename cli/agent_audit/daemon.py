@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional, Set, Dict, Any, Tuple
 
 from .config import load_config, save_config, _get_config_path
-from .bpf_loader import load_bpf, register_pid, update_agent_tree, fetch_events, deduplicate_events, unload_bpf, set_elf_path, lookup_agent_tree
+from .bpf_loader import load_bpf, register_pid, update_agent_tree, fetch_events, deduplicate_events, unload_bpf, set_elf_path, lookup_agent_tree, update_target_comm, clear_target_comms
 from .log_rotator import make_audit_logger, make_runtime_logger
 
 # DAS-DS constants
@@ -260,6 +260,24 @@ def register_agent_pid(pid: int, runtime_logger: Optional[object] = None) -> boo
     return True
 
 
+def _sync_target_comms(cfg: dict, runtime_logger=None) -> None:
+    """Clear target_comms BPF map and write current --process targets."""
+    clear_target_comms()
+
+    targets = cfg.get("targets", [])
+    comms = []
+    for t in targets:
+        if not t.get("enabled", True):
+            continue
+        comm = t.get("process", "")
+        if comm:
+            update_target_comm(comm)
+            comms.append(comm)
+
+    if runtime_logger:
+        runtime_logger.info(f"Synced target_comms: {comms}")
+
+
 # ── PID file ────────────────────────────────────────────────────────────────────
 
 def _write_pid() -> None:
@@ -337,16 +355,34 @@ def _sig_handler(signum, frame) -> None:
 # ── inotify ───────────────────────────────────────────────────────────────────
 
 def _setup_inotify(config_path: str) -> Optional[int]:
+    """Setup inotify watch on parent directory to catch rename/move events.
+
+    Watch parent dir instead of file itself because:
+    - shutil.move (atomic rename) triggers IN_DELETE_SELF + IN_MOVED_TO
+    - Watching file: IN_DELETE_SELF destroys the watch
+    - Watching parent: IN_MOVED_TO is received for new file
+
+    Events monitored: MOVED_TO | CREATE | MODIFY | CLOSE_WRITE
+    """
     try:
         import ctypes
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        fd = libc.inotify_init1(0x00000800)
+
+        # Watch parent directory, not the file itself
+        parent_dir = os.path.dirname(config_path)
+        config_name = os.path.basename(config_path)
+
+        fd = libc.inotify_init1(0x00000800)  # IN_CLOEXEC
         if fd == -1:
             return None
-        wd = libc.inotify_add_watch(fd, config_path.encode(), 0x00000002 | 0x00000008)
+
+        # IN_MOVED_TO (0x80) | IN_CREATE (0x100) | IN_MODIFY (0x02) | IN_CLOSE_WRITE (0x08)
+        mask = 0x00000080 | 0x00000100 | 0x00000002 | 0x00000008
+        wd = libc.inotify_add_watch(fd, parent_dir.encode(), mask)
         if wd == -1:
             os.close(fd)
             return None
+
         return fd
     except (OSError, AttributeError):
         return None
@@ -441,6 +477,8 @@ def run_loop() -> None:
     n = _scan_targets(cfg, _runtime_logger)
     if n:
         _runtime_logger.info(f"Target scan registered {n} PIDs")
+
+    _sync_target_comms(cfg, _runtime_logger)
 
     seen_events: Set[int] = set()
 
@@ -860,16 +898,44 @@ def run_loop() -> None:
             last_inotify_check = now
             try:
                 import select
+                import struct
                 r, _, _ = select.select([inotify_fd], [], [], 0)
                 if r:
-                    os.read(inotify_fd, 4096)
-                    new_cfg = load_config(_CONFIG_PATH)
-                    cfg.clear()
-                    cfg.update(new_cfg)
-                    _runtime_logger.info("Config reloaded")
-                    n = _scan_targets(cfg, _runtime_logger)
-                    if n:
-                        _runtime_logger.info(f"Config reload scan registered {n} new PIDs")
+                    # Parse inotify events and check if config.json changed
+                    config_basename = os.path.basename(_CONFIG_PATH)
+                    data = os.read(inotify_fd, 4096)
+                    offset = 0
+                    config_changed = False
+
+                    while offset < len(data):
+                        # inotify_event: wd(4) + mask(4) + cookie(4) + len(4) = 16 bytes
+                        if offset + 16 > len(data):
+                            break
+                        wd, mask, cookie, name_len = struct.unpack_from('iIII', data, offset)
+                        offset += 16
+
+                        # Extract name (null-terminated, padded to name_len)
+                        if name_len > 0 and offset + name_len <= len(data):
+                            name_bytes = data[offset:offset + name_len]
+                            name = name_bytes.rstrip(b'\x00').decode('utf-8', errors='replace')
+                            offset += name_len
+
+                            # Check if this event is for our config file
+                            if name == config_basename:
+                                config_changed = True
+                                break  # No need to parse further
+                        else:
+                            break
+
+                    if config_changed:
+                        new_cfg = load_config(_CONFIG_PATH)
+                        cfg.clear()
+                        cfg.update(new_cfg)
+                        _runtime_logger.info("Config reloaded")
+                        n = _scan_targets(cfg, _runtime_logger)
+                        if n:
+                            _runtime_logger.info(f"Config reload scan registered {n} new PIDs")
+                    _sync_target_comms(cfg, _runtime_logger)
             except Exception:
                 pass
 
