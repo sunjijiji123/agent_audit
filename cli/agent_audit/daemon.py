@@ -464,6 +464,15 @@ def run_loop() -> None:
         except (OSError, PermissionError):
             return ""
 
+    @functools.lru_cache(maxsize=512)
+    def _detect_elf_file(path: str) -> str:
+        """Detect ELF executable files using magic byte check."""
+        try:
+            with open(path, "rb") as f:
+                return "ELF" if f.read(4) == b'\x7fELF' else ""
+        except (OSError, PermissionError):
+            return ""
+
     # ── BPF timestamp conversion ─────────────────────────────────────────────────
     _boot_to_epoch_ns = 0
     _last_boot_update = 0.0
@@ -495,12 +504,14 @@ def run_loop() -> None:
         return _boot_to_epoch_ns
 
     def _convert_bpf_timestamp(ts_ns: int) -> tuple:
-        """将 BPF boot time 转换为 (localTime ISO8601, unixTime epoch秒)."""
+        """将 BPF boot time 转换为 (localTime 字符串, unixTime epoch秒)."""
         offset = _get_boot_to_epoch_offset()
         epoch_ns = ts_ns + offset
         epoch_s = epoch_ns // 1_000_000_000
         dt = datetime.fromtimestamp(epoch_s, tz=timezone.utc).astimezone()
-        return dt.isoformat(), epoch_s
+        # 自定义格式：YYYY-MM-DD HH:MM:SS（无时区后缀）
+        local_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+        return local_time, epoch_s
 
     # ── Action 推断 ─────────────────────────────────────────────────────
     def _infer_action_from_type(event_type: str) -> str:
@@ -612,6 +623,64 @@ def run_loop() -> None:
         except (OSError, PermissionError):
             return ""
 
+    # ── NET dest/src helpers ──────────────────────────────────────────
+    def _parse_net_dest(data: str) -> tuple:
+        """Parse sockaddr string from loader.c into (family, dest_ip, dest_port)."""
+        if data.startswith("AF_INET6 "):
+            rest = data[len("AF_INET6 "):]
+            bracket_end = rest.rfind(']')
+            if bracket_end > 0 and rest.startswith('['):
+                dest_ip = rest[1:bracket_end]
+                port_str = rest[bracket_end + 1:]
+                if port_str.startswith(':'):
+                    try:
+                        return "AF_INET6", dest_ip, int(port_str[1:])
+                    except ValueError:
+                        pass
+            return "AF_INET6", rest, 0
+        elif data.startswith("AF_INET "):
+            rest = data[len("AF_INET "):]
+            colon = rest.rfind(':')
+            if colon > 0:
+                try:
+                    return "AF_INET", rest[:colon], int(rest[colon + 1:])
+                except ValueError:
+                    pass
+            return "AF_INET", rest, 0
+        else:
+            return "unknown", "", 0
+
+    def _lookup_net_src(pid: int, dest_ip: str, dest_port: int) -> tuple:
+        """Look up source address from /proc/{pid}/net/tcp by matching dest."""
+        if dest_port == 0 or not dest_ip:
+            return "0.0.0.0", 0
+        try:
+            parts = dest_ip.split('.')
+            if len(parts) != 4:
+                return "0.0.0.0", 0
+            hex_ip = f"{int(parts[3]):02X}{int(parts[2]):02X}{int(parts[1]):02X}{int(parts[0]):02X}"
+        except (ValueError, IndexError):
+            return "0.0.0.0", 0
+
+        remote_pattern = f"{hex_ip}:{dest_port:04X}"
+
+        try:
+            with open(f"/proc/{pid}/net/tcp") as f:
+                for line in f:
+                    fields = line.split()
+                    if len(fields) < 4 or fields[0].endswith(':'):
+                        continue
+                    if fields[2] == remote_pattern:
+                        local_parts = fields[1].split(':')
+                        if len(local_parts) == 2:
+                            src_hex_ip = local_parts[0]
+                            ip_parts = [str(int(src_hex_ip[i:i + 2], 16)) for i in range(6, -1, -2)]
+                            return '.'.join(ip_parts), int(local_parts[1], 16)
+        except (OSError, PermissionError, ValueError):
+            pass
+
+        return "0.0.0.0", 0
+
     # ── 单事件日志构建（DAS-DS 扁平格式） ───────────────────────────────
     def _build_single_event_log(event: Dict) -> Dict:
         """将单个 BPF 事件转换为 DAS-DS 扁平 JSON 日志."""
@@ -662,10 +731,10 @@ def run_loop() -> None:
 
         parent_process_guid = ""
 
-        # processMd5 from exe path
-        process_md5 = _compute_md5(proc_info["exe"]) if proc_info["exe"] else ""
+        # processMd5: set to empty (calculation deferred)
+        process_md5 = ""
 
-        # data_key for logfuzId
+        # data_key for logfuzId (deferred - set to empty)
         data_key = ""
         if bpf_type == "FILE":
             if action in ("read", "write"):
@@ -674,13 +743,15 @@ def run_loop() -> None:
             else:
                 data_key = data
         elif bpf_type == "NET":
-            data_key = data.split(" ", 1)[1] if " " in data else data
+            _, _dest_ip, _dest_port = _parse_net_dest(data)
+            data_key = f"{_dest_ip}:{_dest_port}"
         elif bpf_type == "DNS":
             data_key = data
         elif bpf_type == "FORK":
             data_key = str(parent_pid)
 
-        logfuz_id = _generate_logfuz_id(event_type, pid, unix_time, op_type, data_key)
+        # logfuzId: set to empty (generation deferred)
+        logfuz_id = ""
 
         # Build flat DAS-DS output
         # logType mapping per DAS-DS spec
@@ -699,7 +770,7 @@ def run_loop() -> None:
             "localTime": local_time,
             "unixTime": unix_time,
             "logfuzId": logfuz_id,
-            "processId": pid,
+            "processId": str(pid),  # DAS-DS requires string format
             "image": proc_info["exe"],
             "commandLine": proc_info["cmdline"],
             "processUserName": proc_info["username"],
@@ -709,27 +780,68 @@ def run_loop() -> None:
             "processGuid": process_guid,
             "traceId": "",
             "parentProcessGuid": parent_process_guid,
-            "parentProcessId": parent_pid,
-            "currentDirectory": proc_info["cwd"],
+            "parentProcessId": str(parent_pid),  # DAS-DS requires string format
         }
 
         # Event-specific top-level fields
         if bpf_type == "FILE":
             if action in ("read", "write"):
+                # read/write: resolve fd to path, filter directories
                 fd, _ = _parse_fd_bytes(data)
                 path = _resolve_fd_path(pid, fd) if fd >= 0 else ""
-                log_entry["filePath"] = path
-            else:
-                log_entry["filePath"] = data
+                # Filter directories and symlinks (no metadata)
+                if path and os.path.isfile(path):
+                    log_entry["filePath"] = path
+                else:
+                    log_entry["filePath"] = ""
+            else:  # open event
+                # open: filter directories, collect metadata
+                path = data
+                # Add empty fields first (deferred capabilities)
+                log_entry["fileMd5"] = ""
+                log_entry["createTime"] = ""
+                log_entry["targetFilename"] = ""
+
+                # Filter directories and symlinks using os.path.isfile
+                if path and os.path.isfile(path):
+                    log_entry["filePath"] = path
+                    # Collect file metadata for regular files
+                    try:
+                        st = os.stat(path)
+                        log_entry["fileSize"] = st.st_size
+                        modify_time_dt = datetime.fromtimestamp(st.st_mtime)
+                        log_entry["modifyTime"] = modify_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+                        log_entry["fileType"] = _detect_elf_file(path)
+                    except (OSError, PermissionError):
+                        # File deleted or permission denied - fields remain empty
+                        log_entry["fileSize"] = 0
+                        log_entry["modifyTime"] = ""
+                        log_entry["fileType"] = ""
+                else:
+                    # Directory or symlink - no metadata
+                    log_entry["filePath"] = ""
+                    log_entry["fileSize"] = 0
+                    log_entry["modifyTime"] = ""
+                    log_entry["fileType"] = ""
         elif bpf_type == "NET":
-            if data.startswith("AF_INET6 "):
-                log_entry["networkDst"] = data[len("AF_INET6 "):]
-            elif data.startswith("AF_INET "):
-                log_entry["networkDst"] = data[len("AF_INET "):]
+            family, dest_ip, dest_port = _parse_net_dest(data)
+            if family == "AF_INET":
+                src_ip, src_port = _lookup_net_src(pid, dest_ip, dest_port)
             else:
-                log_entry["networkDst"] = data
+                src_ip, src_port = "0.0.0.0", 0
+            log_entry["transProtocol"] = "TCP"
+            log_entry["srcAddress"] = src_ip
+            log_entry["srcPort"] = src_port
+            log_entry["destAddress"] = dest_ip
+            log_entry["destPort"] = dest_port
         elif bpf_type == "DNS":
             log_entry["requestDomain"] = data
+        elif bpf_type == "FORK":
+            if fork_time_ns:
+                process_start_time, _ = _convert_bpf_timestamp(fork_time_ns)
+                log_entry["processStartTime"] = process_start_time
+            else:
+                log_entry["processStartTime"] = ""
 
         return log_entry
 

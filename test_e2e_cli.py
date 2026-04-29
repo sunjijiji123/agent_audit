@@ -198,10 +198,11 @@ def main():
     # Check NET events — this is the key test
     if net_events:
         e = net_events[0]
-        dst = e.get("networkDst", "")
-        log(f"  ✓ NET: dst='{dst}'")
-        if not dst:
-            log("  ✗ NET data is empty!")
+        dest_addr = e.get("destAddress", "")
+        dest_port = e.get("destPort", 0)
+        log(f"  ✓ NET: destAddress='{dest_addr}', destPort={dest_port}")
+        if not dest_addr:
+            log("  ✗ NET destAddress is empty!")
             all_ok = False
         else:
             log(f"  ✓ NET data parsed successfully!")
